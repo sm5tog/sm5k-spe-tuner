@@ -124,10 +124,11 @@ WARNINGS = {
 latest = {
     "flags":        None,
     "power":        None,
-    "freq":         None,   # aktiv TX-frekvens (väljs av användaren via RX-knapp)
+    "freq":         None,   # aktiv TX-frekvens
     "freq_rx0":     None,   # VFO A på TRX 0
     "freq_rx1":     None,   # VFO A på TRX 1
-    "tx_trx":       0,      # valt TRX för tune (0=RX1, 1=RX2) — sätts av GUI-knapp
+    "tx_trx":       0,      # aktivt TX-TRX (0=RX1, 1=RX2)
+    "trx_active":   {0: False, 1: False},  # vilka TRX som för tillfället sänder
     "timestamp":    0,
     "ser":          None,
     "active_radio": None,   # radio-dict för aktiv ingång
@@ -364,11 +365,19 @@ def tci_listener_loop(callback, running):
                         parts = msg.rstrip(";").split(",")
                         trx = int(parts[0].split(":")[1])
                         active = parts[1].strip().lower() == "true"
-                        if active:
-                            latest["tx_trx"] = trx
+                        latest["trx_active"][trx] = active
+                        # Välj aktivt TX-TRX: lägst index som sänder, annars behåll
+                        if latest["trx_active"][0]:
+                            new_trx = 0
+                        elif latest["trx_active"][1]:
+                            new_trx = 1
+                        else:
+                            new_trx = latest["tx_trx"]  # ingen sänder — behåll
+                        if new_trx != latest["tx_trx"]:
+                            latest["tx_trx"] = new_trx
                             latest["freq"] = _active_tx_freq()
                             callback("radio_freq", latest["freq"])
-                            callback("log", f"trx:{trx},true → TX RX{trx+1}")
+                        callback("log", f"trx:{trx},{str(active).lower()} → TX RX{latest['tx_trx']+1}")
                     except (ValueError, IndexError):
                         pass
 
@@ -388,6 +397,7 @@ def tci_listener_loop(callback, running):
         latest["freq"] = None
         latest["freq_rx0"] = None
         latest["freq_rx1"] = None
+        latest["trx_active"] = {0: False, 1: False}
         callback("tci_status", "disconnected")
         callback("radio_freq", 0)
         if running["run"]:
