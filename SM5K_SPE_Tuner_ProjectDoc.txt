@@ -1,0 +1,374 @@
+================================================================
+SM5K SPE Tuner v1.0.0  –  Project Documentation
+================================================================
+SPE Expert 1K-FA computer controller
+Author: SM5K (SM5TOG)
+Developed with: Claude (Anthropic) via Claude Code / Fleet
+
+This document describes the full project: design decisions,
+protocol details, architecture, and lessons learned.
+Intended as reference for continued development.
+================================================================
+
+
+1. PROJECT OVERVIEW
+----------------------------------------------------------------
+A single-file Python/Tkinter application that provides computer
+control of the SPE Expert 1K-FA solid-state linear amplifier
+via RS-232 serial, with frequency coordination through TCI
+(ExpertSDR WebSocket protocol).
+
+Key capabilities:
+  - Real-time telemetry display (power, SWR/reflected power,
+    temperature, band, antenna, mode, alarms)
+  - Manual tune trigger at current VFO frequency
+  - Automatic band sweep (full band ATU programming)
+  - Two-radio support (two inputs, independent TCI connections)
+  - In-app settings (no external config file dependency)
+  - Auto-reconnect on serial or TCI dropout
+  - Standalone EXE distribution (PyInstaller)
+
+Files:
+  tuner17.py              – Main source (single file, ~950 lines)
+  SM5K_SPE_Tuner.exe      – Standalone Windows executable
+  settings.json           – Auto-generated user configuration
+  SM5K_SPE_Tuner_Instructions.txt  – Beta tester guide
+  SM5K_SPE_Tuner_ProjectDoc.txt    – This file
+
+Locked reference versions (development history):
+  tuner15.py + core15.py  – Original split architecture (v1.5)
+  tuner16.py              – First dark-theme redesign (v1.6)
+
+
+2. DEVELOPMENT HISTORY
+----------------------------------------------------------------
+The project evolved from a Copilot-generated prototype (tuner15
++ core15) through several major iterations:
+
+v1.5 (core15.py + tuner15.py)
+  - Two-file architecture: core logic + GUI
+  - configparser .ini file for settings
+  - Basic telemetry, band sweep, manual tune
+  - TCI connection with no timeout handling (LOST too often)
+
+v1.6 (tuner16.py, locked reference)
+  - Dark professional instrument theme
+  - CollapsibleSection widget for Band Sweep and Log
+  - Meter widget (canvas bar) for Power and SWR
+  - TX badge, OPERATE colour indicator
+  - TCI timeout fixed: settimeout(30), inner catch for both
+    WebSocketTimeoutException and socket.timeout; send vfo:0,0;
+    poll on silence instead of breaking connection
+  - ALARM monitoring added (DISPLAY_CTX byte from protocol)
+  - Still two-file; still uses .ini config
+
+v1.0.0 (tuner17.py – current release)
+  - Merged into single file
+  - settings.json replaces .ini, editable via in-app dialog
+  - Serial open moved into retry loop (program always starts
+    even if COM port unavailable)
+  - Two-radio support (see section 5)
+  - Hz-precision frequency display
+  - Power HIGH/LOW button text
+  - Verbose log for all state transitions
+  - REF POWER / SWR shared meter (see section 6)
+  - Temperature colour coding and unit-aware display
+  - Reflected power monitoring
+  - Settings simplified: only COM port is user-configurable;
+    baudrate hardcoded (9600, fixed in amp firmware);
+    sweep step hardcoded (25 kHz, matches ATU segment size)
+
+
+3. SERIAL PROTOCOL (SPE Expert RS-232)
+----------------------------------------------------------------
+Reference: EXPERT 1K-FA Communication Protocol Spec Rev. 2.0
+
+Physical layer:
+  9600 baud, 8N1, straight-through DB9 cable
+  DTR line raised HIGH to keep amplifier powered on
+  (lowering DTR turns amp off after ~500 ms)
+
+Packet from PC to amplifier:
+  [0x55 0x55 0x55]  sync (3 bytes)
+  [CNT]             data byte count (excl. checksum)
+  [DATA...]         command bytes
+  [CHK]             sum mod 256 of DATA bytes
+
+To activate RCU (streaming mode):
+  [0x55 0x55 0x55 0x01 0x80 0x80]
+  Sent once at connect. Amp then streams STATUS packets
+  at ~25 Hz (every ~40 ms).
+
+Key commands used (KEY_ON = 0x10):
+  Keycode  Function
+  0x1C     OPERATE/STANDBY toggle
+  0x2B     ANT cycle
+  0x1A     FULL/HALF power toggle
+  0x34     TUNE (start ATU)
+  0x18     OFF (power down amp)
+
+STATUS packet from amplifier (35 bytes total):
+  [0]  [1]  [2]   0xAA 0xAA 0xAA  (sync)
+  [3]         0x1E               (30 data bytes follow)
+  [4]         STATUS_CODE         0xA0=startup STBY, 0xA1=startup OP
+  [5]         FLAGS byte:
+                bit 0  TUNE    – ATU cycle in progress
+                bit 1  OP/STBY – 1=OPERATE, 0=STANDBY
+                bit 2  TX      – transmitting
+                bit 3  ALARM   – alarm active
+                bit 4  MODE    – 1=FULL power, 0=HALF power
+                bit 5  CONTEST – contest fan mode
+                bit 6  BEEP    – key beep enabled
+                bit 7  T_SCALE – 1=Celsius, 0=Fahrenheit
+  [6]         DISPLAY_CTX byte:
+                0x00  STANDBY display (logo)
+                0x01  OPERATE display (PA_OUT + I_PA bars)
+                0x02  OPERATE display (PW_REV + V_PA bars)
+                0x11-0x18, 0x1B-0x1C, 0x1E  = WARNING codes:
+                  0x11  VOLT LOW (HALF mode, <20V)
+                  0x12  VOLT LOW (FULL mode, <26V)
+                  0x13  VOLT HIGH (HALF, >50V)
+                  0x14  VOLT HIGH (FULL, >50V)
+                  0x15  CURRENT HIGH (HALF, >40A)
+                  0x16  CURRENT HIGH (FULL, >50A)
+                  0x17  OVERTEMP >90C
+                  0x18  DRIVE TOO HIGH
+                  0x1B  HIGH REVERSE POWER (>300W)
+                  0x1C  PA PROTECTION
+                  0x1E  SHUTDOWN
+  [7..17]     SETUP_0..SETUP_10 (context-dependent aux bytes)
+  [18]        BAND | INPUT:
+                bits 7-4  band index (0=160m .. 9=6m)
+                bits 3-0  input (0=IN1, 1=IN2)
+  [19]        SUB_BAND index (0-126, 25 kHz segments)
+  [20..21]    FREQ_LO / FREQ_HI – frequency in kHz (16-bit)
+  [22]        ANTENNA | CAT:
+                bits 7-4  CAT type
+                bits 3-0  antenna (0=ANT1 .. 3=ANT4, 4=none)
+  [23..24]    SWR_LO / SWR_HI  (STANDBY: SWR*100, range 0-9999)
+              GAIN_LO / GAIN_HI (OPERATE: PA gain dB*10)
+  [25]        TEMPERATURE (Celsius or Fahrenheit per T_SCALE bit)
+  [26..27]    PA_OUT_LO / PA_OUT_HI – power Wpep*10
+                STANDBY: exciter drive power (0-200W)
+                OPERATE: amplifier output power (0-1200W)
+  [28..29]    PR_LO / PR_HI – reflected power Wpep*10 (0-200W)
+  [30..31]    VA_LO / VA_HI – PA supply voltage V*10 (0-60V)
+  [32..33]    IA_LO / IA_HI – PA supply current A*10 (0-50A)
+  [34]        CHECKSUM (sum mod 256 of bytes [4]..[33])
+
+Packet sync: look for 3x 0xAA, then read exactly 35 bytes.
+Buffer is accumulated from serial.read() and scanned for
+the sync header; incomplete or misaligned data is discarded.
+
+
+4. TCI PROTOCOL (ExpertSDR WebSocket)
+----------------------------------------------------------------
+TCI = Transceiver Control Interface, WebSocket-based.
+Default: ws://127.0.0.1:50001
+
+Commands used:
+  "vfo:0,0;"           – request current VFO A frequency
+  "vfo:0,0,{freq};"   – set VFO A to {freq} Hz
+  "tune:0,true;"      – start CW carrier (TX on)
+  "tune:0,false;"     – stop carrier (TX off)
+  "modulation:0,CW;"  – ensure CW mode before tuning
+
+Frequency arrives as: "vfo:0,0,14225000;"
+
+Connection management:
+  - settimeout(30) so recv() blocks up to 30 seconds
+  - On timeout, send vfo:0,0; poll to keep connection alive
+    (catches both WebSocketTimeoutException and socket.timeout)
+  - On radio switch (active_radio changes), inner loop breaks
+    and reconnects to the new radio's TCI URL
+  - Reconnect delay: 3 seconds
+
+
+5. TWO-RADIO ARCHITECTURE
+----------------------------------------------------------------
+The 1K-FA has two inputs (IN1, IN2). The amplifier switches
+to whichever input last received an RF signal.
+
+Design:
+  - settings.json stores a "radios" list, each entry:
+      { "name": "SUNSDR2 DX", "input": 1,
+        "tci_host": "127.0.0.1", "tci_port": 50001 }
+  - Packet byte [18] bits 3-0 report active input (0=IN1,1=IN2)
+  - find_radio(input_nr) looks up configured radio by input nr
+  - latest["active_radio"] updated on every packet
+  - _tci_url() reads active_radio to select correct WebSocket URL
+  - TCI loop breaks and reconnects when _tci_url() changes
+
+Lock logic:
+  - Active input matches a configured radio → controls normal,
+    radio name shown in green in top bar
+  - Active input is unknown (not in settings) → controls
+    disabled, orange warning banner shown
+  - This protects against accidentally tuning when another
+    station/operator has activated the amp on the other input
+
+Key insight: if BOTH inputs are configured (same computer
+controlling both radios), controls stay fully active regardless
+of which input is active. Only a truly unknown source locks out.
+
+
+6. SWR / REF POWER SHARED METER
+----------------------------------------------------------------
+The SPE protocol uses bytes [23:24] for two different values:
+  STANDBY mode: SWR * 100 (e.g. 187 = SWR 1.87)
+  OPERATE mode: PA Gain in dB * 10
+
+And bytes [28:29] for reflected power (only valid in OPERATE).
+
+Observation: SWR is only meaningful in STANDBY; reflected power
+is only meaningful in OPERATE. They are mutually exclusive.
+
+Implementation: a single Meter widget whose header label,
+scale, and colour thresholds switch when OP flag toggles:
+
+  STANDBY → label="SWR",       max=3.0,  amber≥1.5, red≥2.5
+  OPERATE → label="REF POWER", max=200W, amber≥60W, red≥150W
+
+The meter clears cleanly on every mode transition.
+
+
+7. TUNE SEQUENCE
+----------------------------------------------------------------
+Manual tune (at current VFO frequency):
+
+  1. Verify serial and TCI connected
+  2. Get current frequency from latest["freq"]
+  3. Open new TCI WebSocket connection
+  4. Send vfo:0,0,{freq}; (confirm frequency)
+  5. Wait FREQ_SETTLE (1.0 s)
+  6. ensure_standby(): verify/force STANDBY mode
+     (up to 3 toggle attempts, 2s each)
+  7. Send modulation:0,CW; (ensure CW mode)
+  8. Send tune:0,true; (start carrier)
+  9. validate_rf(): wait up to 3s for power 2-15W
+     (too low = no drive, too high = risk damage)
+  10. send_tune() → keycode 0x34 (triggers ATU)
+  11. wait_for_tune(): watch TUNE flag 0→1→0 (up to 10s)
+  12. Send tune:0,false; (stop carrier)
+
+Per SPE specification: tuning always in STANDBY mode.
+The ATU finds minimum SWR and stores result in the sub-band
+memory table for the active input.
+
+Band sweep: same sequence repeated every 25 kHz across
+the selected sub-band range. The 25 kHz step matches the
+ATU's internal memory segment size.
+
+RF validation thresholds (2W min, 15W max) were established
+to ensure the ATU gets enough drive without risking damage
+to the ATU or PA if something is misconfigured.
+
+
+8. GUI ARCHITECTURE
+----------------------------------------------------------------
+Single-threaded Tkinter main loop + two daemon threads:
+
+  Thread 1: telemetry_loop(callback, running)
+    - Opens serial port (retries every 3s on failure)
+    - Activates RCU streaming mode
+    - Reads 35-byte packets continuously
+    - Parses all fields, updates latest{} dict
+    - Puts telemetry events on queue via callback
+
+  Thread 2: tci_listener_loop(callback, running)
+    - Opens WebSocket to TCI server (retries every 3s)
+    - Receives frequency updates
+    - Polls with vfo:0,0; on silence (30s timeout)
+    - Breaks inner loop when active radio changes URL
+    - Puts radio_freq events on queue
+
+  Main thread: process_queue() via root.after(100, ...)
+    - Drains queue, updates all widgets
+    - Never blocks Tkinter event loop
+
+  Tune/sweep threads: short-lived, started on user action
+    - Communicate back via same callback/queue mechanism
+    - stop_requested threading.Event for clean abort
+
+Shared state (latest dict):
+  latest["flags"]        – most recent FLAGS byte parsed
+  latest["power"]        – most recent power reading (W)
+  latest["freq"]         – most recent VFO frequency (Hz)
+  latest["timestamp"]    – time of last packet
+  latest["ser"]          – active serial.Serial object (or None)
+  latest["active_radio"] – radio dict for current input (or None)
+
+
+9. KEY DESIGN DECISIONS
+----------------------------------------------------------------
+Q: Why single file?
+A: Easier distribution. Betatestare gets one .py (or one .exe).
+   No import path issues, no missing core15.py etc.
+
+Q: Why settings.json instead of .ini?
+A: Native Python json module, no configparser dependency.
+   Supports nested structures (radios list). Easy to read/edit
+   manually if needed.
+
+Q: Why hardcode baudrate and sweep step?
+A: Baudrate (9600) is fixed in amplifier firmware – not user
+   configurable. Sweep step (25 kHz) matches ATU memory
+   segments – wrong step would retune already-tuned segments
+   or miss some. No value in exposing these.
+
+Q: Why always open serial in the retry loop?
+A: Allows program to start without the amp connected.
+   Settings dialog always accessible. Same pattern as TCI.
+   User can plug in the cable after starting the program.
+
+Q: Why validate RF power (2-15W) before sending TUNE?
+A: Protects against: (a) no drive at all (ALC clamp, wrong
+   mode), (b) accidental high drive that could damage ATU.
+   15W ceiling gives safe margin for ATU tuning.
+
+Q: Why not show PA Gain (OPERATE mode [23:24] value)?
+A: Limited screen space. REF POWER is more operationally
+   useful. PA Gain is stable once amp is running correctly.
+
+Q: Why not validate checksum?
+A: In practice, RS-232 at 9600 baud over short cables is
+   extremely reliable. Checksum validation would add
+   complexity for minimal real-world benefit. The sync
+   header (3x 0xAA) already provides good packet alignment.
+
+
+10. KNOWN LIMITATIONS / FUTURE WORK
+----------------------------------------------------------------
+- No VA/IA display (supply voltage and current available in
+  protocol bytes [30..33] but not shown in UI)
+- No alarm history viewer (requires navigating amp's display
+  menu via SET/arrow keys through RS-232 – complex)
+- No CAT passthrough mode (protocol supports CAT_232 command
+  for RS-232 frequency control, but TCI is sufficient here)
+- PyInstaller EXE is large (~15 MB) due to Python runtime
+  bundling. Normal for Python standalone executables.
+- settings.json stored in same directory as the script/EXE.
+  If run from a protected directory, it may fail to save.
+  Workaround: run from user's Documents or Desktop folder.
+- Temperature thresholds (70C amber, 83C red) are for
+  NORMAL fan mode. In CONTEST mode the thresholds are
+  different (60C, 75C). Currently not differentiated.
+
+
+11. DEPENDENCIES
+----------------------------------------------------------------
+Standard library: tkinter, threading, queue, time, json, os,
+                  socket
+
+Third-party (pip install):
+  websocket-client    – TCI WebSocket connection
+  pyserial            – RS-232 serial port
+
+Build tool:
+  pyinstaller         – Creates standalone Windows .exe
+
+Python version: 3.14 (developed and tested)
+OS: Windows 10/11
+================================================================
+SM5K  –  2025
+================================================================

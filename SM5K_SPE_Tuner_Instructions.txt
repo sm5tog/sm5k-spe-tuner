@@ -1,0 +1,217 @@
+================================================================
+SM5K SPE Tuner v1.0.0  –  User Instructions
+================================================================
+Controller software for SPE Expert 1K-FA linear amplifier
+and SunSDR transceiver (or other TCI-compatible radio)
+Author: SM5K (SM5TOG)
+
+
+REQUIREMENTS
+----------------------------------------------------------------
+- SPE Expert 1K-FA linear amplifier
+- SunSDR2 DX or other TCI-compatible transceiver
+  (TCI is required – the radio provides the carrier wave
+  used during ATU tuning)
+- ExpertSDR running with TCI enabled
+- Windows PC with available USB/COM port
+- Standard RS-232 cable (straight-through, DB9, supplied with amp)
+
+
+IMPORTANT WARNINGS
+----------------------------------------------------------------
+READ BEFORE FIRST USE.
+
+This software transmits RF automatically. During both manual
+tune and band sweep, the transceiver is put into transmit mode
+without further confirmation. Make sure the following
+conditions are met before pressing TUNE or starting a sweep:
+
+DRIVE POWER – 2 to 15 Watts required
+  The program measures the drive power from the radio before
+  triggering the ATU. It will abort with an error if:
+    - Power is below 2W  (too weak to tune reliably)
+    - Power is above 15W (risk of damage to the ATU)
+
+  SunSDR does not have an ALC output. You MUST set the
+  transceiver output power manually to approximately 5-10W
+  before tuning. Do this in ExpertSDR's power control before
+  pressing TUNE or starting a sweep. Failure to do so may
+  result in the tune being aborted or, if the software fails
+  to detect it in time, damage to the ATU.
+
+  Do NOT use the amplifier's full 1kW output for tuning –
+  tuning always takes place in STANDBY (exciter only).
+
+ANTENNA – verify before tuning
+  Never tune into an open feedline, dummy load, or antenna
+  with SWR greater than 3:1. The internal ATU handles up to
+  3:1 (2.5:1 on 6m). Higher SWR may damage the ATU.
+  Always ensure the correct antenna is connected and the
+  feedline is intact before initiating a tune cycle.
+
+BAND SWEEP – unattended transmission
+  A band sweep transmits repeatedly for several minutes.
+  Monitor the first sweep carefully. Have the STOP button
+  within reach. Abort immediately if:
+    - The amplifier shows any alarm
+    - Reflected power (REF POWER) climbs unexpectedly
+    - Temperature rises faster than expected
+    - Any unusual noise or behaviour from the equipment
+
+POWER SETTING – use HALF during tuning and initial tests
+  Set the amplifier to "Power: LOW" (HALF mode = 500W max)
+  when tuning or testing for the first time. Switch to HIGH
+  only when you have confirmed correct operation.
+
+RESPONSIBILITY
+  This is amateur software provided as-is. The author takes
+  no responsibility for damage to equipment or installations.
+  The operator is solely responsible for correct use and for
+  ensuring all transmissions comply with applicable licence
+  conditions and regulations.
+
+----------------------------------------------------------------
+
+FIRST-TIME SETUP
+----------------------------------------------------------------
+1. Connect the RS-232 cable between the amplifier and PC.
+   Note the COM port number assigned by Windows (check Device
+   Manager under "Ports (COM & LPT)").
+
+2. Start SM5K_SPE_Tuner.exe (or tuner17.py).
+
+3. Click the gear icon (top right) to open Settings.
+
+4. Under "SPE EXPERT AMPLIFIER":
+   - Set COM Port to the correct port (e.g. COM4, COM6)
+
+5. Under "RADIO 1" and "RADIO 2":
+   - Enter the name of each connected transceiver (e.g. "SUNSDR2 DX")
+   - Set Input to 1 or 2 matching the rear panel INPUT connector
+   - Set TCI Host (usually 127.0.0.1) and TCI Port (e.g. 50001)
+   If you only use one radio, leave Radio 2 name blank.
+
+6. Click Save. The program reconnects automatically.
+
+
+MAIN DISPLAY
+----------------------------------------------------------------
+Top bar:
+  TCI: OK / LOST    – Connection to ExpertSDR
+  Serial: OK / LOST – Connection to amplifier RS-232
+  Radio name        – Which radio is currently active on the amp
+
+Meters:
+  POWER   – Forward output power (W). Amber >60W, Red >100W.
+  SWR     – Standing Wave Ratio in STANDBY mode.
+             Switches to REF POWER (reflected W) in OPERATE mode.
+             SWR: Amber >=1.5, Red >=2.5
+             REF POWER: Amber >60W, Red >150W
+
+Info row:
+  TX      – Red badge when transmitting
+  Band    – Current band (160, 80, 40 ... 6)
+  Temp    – Heatsink temperature. Amber >=70C, Red >=83C
+  Freq    – Current VFO frequency from radio (Hz precision)
+
+Control buttons:
+  Mode: STANDBY / OPERATE  – Click to toggle. Amber when OPERATE.
+  ANT: x                   – Click to cycle antenna 1-4
+  Power: HIGH / LOW        – Click to toggle FULL/HALF power
+
+TUNE button:
+  Tunes the amplifier at the radio's current frequency.
+  Uses CW carrier via TCI, then triggers the ATU.
+  Always tunes in STANDBY mode per SPE specification.
+
+STOP button:
+  Immediately halts any ongoing tune or sweep operation.
+
+
+BAND SWEEP
+----------------------------------------------------------------
+Click "BAND SWEEP" to expand the section.
+
+Each band is split into two segments:
+  L  (Low)  – The lower part of the band, covering the CW and
+               digital modes portion. Example: 40L covers the
+               CW/digi segment at the bottom of 40m.
+  H  (High) – The upper part of the band, covering SSB and the
+               rest up to the band edge. Example: 40H covers
+               the phone portion of 40m.
+  30         – 30m has only one segment (narrow band, CW only).
+
+You only need to tune the segments you actually use:
+
+  CW or FT8/digital only?  → Tune the L segment only.
+  SSB only?                 → Tune the H segment only.
+  Both modes?               → Tune both L and H.
+
+For many operators who primarily work CW or digital modes,
+tuning only the L segments across all bands takes just a few
+minutes and is all that is needed. There is no point tuning
+the SSB portion of the band if you never operate there.
+
+Select a segment button (e.g. "20L", "20H") to start a sweep.
+The program will:
+  1. Step through the segment in 25 kHz increments (matching
+     the amplifier's internal tuner memory segments)
+  2. Tune the ATU at each frequency point
+  3. Store the result in the amplifier's memory
+
+Allow the sweep to complete before operating on that band.
+The amplifier remembers the tuning for each segment – you only
+need to sweep again if you change antenna or antenna position.
+
+Note: Sweep both INPUT 1 and INPUT 2 separately if you use
+two transceivers, as the tuner stores separate tables per input.
+
+
+ALARM DISPLAY
+----------------------------------------------------------------
+If the amplifier reports an alarm or protection event, a red
+banner appears below the meters showing the fault type:
+
+  VOLT LOW / HIGH       – Power supply voltage out of range
+  CURRENT HIGH          – PA current too high
+  OVERTEMP >90C         – Heatsink temperature critical
+  DRIVE TOO HIGH        – Input drive from transceiver too high
+  HIGH REVERSE POWER    – High reflected power (check antenna)
+  PA PROTECTION         – Internal PA protection triggered
+  SHUTDOWN              – Amplifier shutting down
+
+HALF / FULL: Note that the amplifier automatically switches
+from FULL to HALF power if temperature rises significantly,
+before the SERIOUS alarm level is reached.
+
+
+TWO RADIO OPERATION
+----------------------------------------------------------------
+The SPE Expert 1K-FA has two inputs (IN1, IN2). The amplifier
+automatically activates whichever input last received a signal.
+
+This program detects the active input from telemetry and:
+  - Shows the active radio's name in the top bar (green)
+  - Keeps all controls active as long as the active radio is one
+    you have configured in Settings
+  - Shows a warning banner and disables controls if an unknown
+    source activates an input (protects against accidental
+    operation from another station/operator)
+
+
+TIPS FOR BETATESTING
+----------------------------------------------------------------
+- Check that SWR/REF POWER meter switches correctly when
+  toggling between STANDBY and OPERATE mode
+- Verify temperature colour coding (requires warm amp)
+- Test STOP button during both manual tune and sweep
+- Try disconnecting and reconnecting the RS-232 cable –
+  the program should recover automatically within ~3 seconds
+- Try disabling TCI in ExpertSDR – TCI: LOST should appear
+  but the program should continue running and reconnect
+- Test with both INPUT 1 and INPUT 2 active
+
+
+================================================================
+SM5K  –  jonny@majava.com
+================================================================
