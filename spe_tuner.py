@@ -1,5 +1,5 @@
 ## ==========================================================
-## SM5K SPE Tuner v1.0.2
+## SM5K SPE Tuner v1.0.3
 ## SPE Expert 1K-FA controller – Single file | In-app settings
 ## Author: SM5K (SM5TOG)
 ## ==========================================================
@@ -725,7 +725,7 @@ class TunerGUI:
         self._locked      = False  # kontroller låsta pga okänd ingång
         self._swr_in_op   = False  # spårar om SWR-rutan visar Rev eller SWR
 
-        root.title("SM5K SPE Tuner v1.0.2")
+        root.title("SM5K SPE Tuner v1.0.3")
         root.configure(bg=BG)
         root.resizable(False, False)
 
