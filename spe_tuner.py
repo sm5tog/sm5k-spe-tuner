@@ -475,7 +475,7 @@ def manual_tune(callback):
 
     ws = websocket.create_connection(_tci_url(), timeout=5)
     try:
-        callback("status", f"MANUAL TUNE RX{trx+1}: {freq/1_000_000:.6f} MHz")
+        callback("status", f"MANUAL TUNE RX{trx+1}: {freq/1_000_000:.3f} MHz")
         set_freq(ws, freq, trx)
         time.sleep(FREQ_SETTLE)
         ensure_standby(ws, callback)
@@ -510,6 +510,7 @@ def run_tune(band, callback):
         return
 
     trx = latest["tx_trx"]
+    restore_freq = latest["freq_rx1"] if trx == 1 else latest["freq_rx0"]
     start_f, end_f = BANDS[band]
     ws = websocket.create_connection(_tci_url(), timeout=5)
     try:
@@ -540,6 +541,9 @@ def run_tune(band, callback):
     finally:
         try: set_tx(ws, False, trx)
         except: pass
+        if restore_freq:
+            try: set_freq(ws, restore_freq, trx)
+            except: pass
         ws.close()
 
     stop_requested.clear()
@@ -559,7 +563,7 @@ class Meter(tk.Frame):
         self._hdr = tk.Label(self, text=label, bg=PANEL, fg=MUTED, font=("Consolas", 8))
         self._hdr.pack(anchor="w")
         self.val_lbl = tk.Label(self, text=f"--- {unit}", bg=PANEL, fg=TEXT,
-                                 font=("Consolas", 28, "bold"))
+                                 font=("Consolas", 28, "bold"), width=6, anchor="w")
         self.val_lbl.pack(anchor="w")
         self.cv   = tk.Canvas(self, bg=BORDER, width=self.BAR_W, height=self.BAR_H,
                                bd=0, highlightthickness=0)
@@ -721,12 +725,13 @@ class TunerGUI:
         self._locked      = False  # kontroller låsta pga okänd ingång
         self._swr_in_op   = False  # spårar om SWR-rutan visar Rev eller SWR
 
-        root.title(f"SM5K SPE Tuner v1.0.2  {time.strftime('%H:%M')}")
+        root.title("SM5K SPE Tuner v1.0.2")
         root.configure(bg=BG)
         root.resizable(False, False)
 
         self.running_flag = start_telemetry(self.callback)
         self._build_ui()
+        root.update_idletasks()
         self.root.after(100, self.process_queue)
 
     # ── Layout ──────────────────────────────────────────────
@@ -740,7 +745,7 @@ class TunerGUI:
 
         self.tci_lbl    = tk.Label(bar, text="TCI: ---",    bg=BORDER, fg=MUTED, font=("Consolas", 9), width=14)
         self.serial_lbl = tk.Label(bar, text="Serial: ---", bg=BORDER, fg=MUTED, font=("Consolas", 9), width=14)
-        self.radio_lbl  = tk.Label(bar, text="",            bg=BORDER, fg=MUTED, font=("Consolas", 9), anchor="e")
+        self.radio_lbl  = tk.Label(bar, text="",            bg=BORDER, fg=MUTED, font=("Consolas", 9), anchor="e", width=22)
         cfg_btn = tk.Button(bar, text="⚙", bg=BORDER, fg=MUTED,
                              activebackground=BORDER, activeforeground=TEXT,
                              relief="flat", font=("Consolas", 12),
@@ -757,9 +762,9 @@ class TunerGUI:
 
         self.power_meter = Meter(self._meters_frame, "POWER", "W",  150, [(60, AMBER),(100, RED)])
         self.swr_meter   = Meter(self._meters_frame, "SWR",   "",   3.0, [(1.5, AMBER),(2.5, RED)])
-        self.power_meter.pack(side="left")
+        self.power_meter.pack(side="left", expand=True, fill="both")
         tk.Frame(self._meters_frame, bg=BORDER, width=1).pack(side="left", fill="y", pady=8)
-        self.swr_meter.pack(side="left")
+        self.swr_meter.pack(side="left", expand=True, fill="both")
 
         # Larmbanners (dolda till de behövs)
         self.alarm_lbl = tk.Label(r, text="", bg=RED, fg="white",
@@ -770,14 +775,15 @@ class TunerGUI:
         # Sekundär info
         info = tk.Frame(r, bg=BG, padx=10, pady=6)
         info.pack(fill="x")
-        self.tx_lbl   = tk.Label(info, text="TX: OFF",   bg=BG, fg=MUTED, font=("Consolas", 10))
+        self.tx_lbl   = tk.Label(info, text="TX: OFF",   bg=BG, fg=MUTED, font=("Consolas", 10), width=8, anchor="center")
         self.band_lbl = tk.Label(info, text="Band: ---", bg=BG, fg=MUTED, font=("Consolas", 10))
         self.temp_lbl = tk.Label(info, text="Temp: ---", bg=BG, fg=MUTED, font=("Consolas", 10))
-        self.freq_lbl = tk.Label(info, text="",          bg=BG, fg=TEXT,  font=("Consolas", 9))
+        self.freq_lbl = tk.Label(info, text="",          bg=BG, fg=TEXT,  font=("Consolas", 9), cursor="hand2")
         self.tx_lbl.pack(side="left", padx=(0,14))
         self.band_lbl.pack(side="left", padx=(0,14))
         self.temp_lbl.pack(side="left")
         self.freq_lbl.pack(side="right")
+        self.freq_lbl.bind("<Button-1>", lambda e: self._toggle_rx())
 
         # Kontrollknappar
         tk.Frame(r, bg=BORDER, height=1).pack(fill="x")
@@ -795,27 +801,24 @@ class TunerGUI:
         self.power_btn.grid(row=0, column=2, padx=(4,0), sticky="we")
         ctrl.columnconfigure((0,1,2), weight=1)
 
-        self.tune_btn = tk.Button(ctrl, text="TUNE", font=("Consolas", 13, "bold"),
-                                   bg=TUNEBG, fg=TUNEFG,
-                                   activebackground=TUNEBG, activeforeground=TUNEFG,
-                                   relief="flat", pady=12, command=self._on_tune)
-        self.tune_btn.grid(row=1, column=0, columnspan=2, sticky="we", pady=(8,0))
+        tune_row = tk.Frame(ctrl, bg=BG)
+        tune_row.grid(row=1, column=0, columnspan=3, sticky="we", pady=(8,0))
+        tune_row.columnconfigure((0,1), weight=1)
 
-        self._sweep_var = tk.BooleanVar(value=False)
-        self._sweep_chk = tk.Checkbutton(
-            ctrl, text="Sweep OFF", variable=self._sweep_var,
-            indicatoron=False,
-            bg=BTNBG, fg=MUTED,
-            selectcolor=TUNEBG,
-            activebackground=BORDER, activeforeground=TEXT,
-            font=("Consolas", 10), cursor="hand2",
-            relief="flat", padx=8, pady=12,
-            command=self._on_sweep_toggle,
-        )
-        self._sweep_chk.grid(row=1, column=2, sticky="we", padx=(4,0), pady=(8,0))
+        self.tune_single_btn = tk.Button(tune_row, text="Tune, single", font=("Consolas", 11, "bold"),
+                                          bg=TUNEBG, fg=TUNEFG,
+                                          activebackground=TUNEBG, activeforeground=TUNEFG,
+                                          relief="flat", pady=12, command=self._on_tune_single)
+        self.tune_single_btn.grid(row=0, column=0, sticky="we")
+
+        self.tune_sweep_btn = tk.Button(tune_row, text="Tune, sweep", font=("Consolas", 11, "bold"),
+                                         bg=TUNEBG, fg=TUNEFG,
+                                         activebackground=TUNEBG, activeforeground=TUNEFG,
+                                         relief="flat", pady=12, padx=4, command=self._on_tune_sweep)
+        self.tune_sweep_btn.grid(row=0, column=1, sticky="we", padx=(4,0))
 
         self._ctrl_widgets = [self.mode_btn, self.ant_btn, self.power_btn,
-                               self.tune_btn, self._sweep_chk]
+                               self.tune_single_btn, self.tune_sweep_btn]
 
         # STOP
         stop_row = tk.Frame(r, bg=BG, padx=10)
@@ -844,25 +847,32 @@ class TunerGUI:
         else:
             self._sweep_chk.config(text="Sweep OFF", fg=MUTED)
 
+    def _toggle_rx(self):
+        latest["tx_trx"] = 1 - latest["tx_trx"]
+        latest["freq"] = _active_tx_freq()
+        self._log(f"TX RX manuellt → RX{latest['tx_trx']+1}")
+        self.queue.put(("radio_freq", latest["freq"]))
+
     def toggle_mode(self):   toggle_operate();    self._log("Toggle Mode")
     def next_ant(self):      next_antenna();      self._log("Next ANT")
     def toggle_power(self):  toggle_power_mode(); self._log("Toggle Power Mode")
 
-    def _on_tune(self):
+    def _on_tune_single(self):
         if self.running: return
-        if self._sweep_var.get():
-            freq = latest.get("freq")
-            band = freq_to_band(freq) if freq else None
-            if not band:
-                self._log("SWEEP FAIL: frekvens matchar inget band")
-                return
-            self.running = True
-            self._log(f"Sweep {band.upper()}")
-            threading.Thread(target=self._run_core, args=(band,), daemon=True).start()
-        else:
-            self.running = True
-            self._log("Manual Tune")
-            threading.Thread(target=self._run_manual, daemon=True).start()
+        self.running = True
+        self._log("Manual Tune")
+        threading.Thread(target=self._run_manual, daemon=True).start()
+
+    def _on_tune_sweep(self):
+        if self.running: return
+        freq = latest.get("freq")
+        band = freq_to_band(freq) if freq else None
+        if not band:
+            self._log("SWEEP FAIL: frekvens matchar inget band")
+            return
+        self.running = True
+        self._log(f"Sweep {band.upper()}")
+        threading.Thread(target=self._run_core, args=(band,), daemon=True).start()
 
     def _run_manual(self):
         try: manual_tune(self.callback)
@@ -968,10 +978,9 @@ class TunerGUI:
                     if "tx" in data:
                         on = data["tx"]
                         self.tx_lbl.config(
-                            text=" ● TX ON " if on else "TX: OFF",
+                            text="● TX ON" if on else "TX: OFF",
                             bg=RED if on else BG,
-                            fg="white" if on else MUTED,
-                            font=("Consolas",11,"bold") if on else ("Consolas",10,"normal"))
+                            fg="white" if on else MUTED)
                         self.power_meter.highlight(on)
                         self.swr_meter.highlight(on)
 
