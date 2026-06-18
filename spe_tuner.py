@@ -1,5 +1,5 @@
 ## ==========================================================
-## SM5K SPE Tuner v1.0.1
+## SM5K SPE Tuner v1.0.2
 ## SPE Expert 1K-FA controller – Single file | In-app settings
 ## Author: SM5K (SM5TOG)
 ## ==========================================================
@@ -124,10 +124,10 @@ WARNINGS = {
 latest = {
     "flags":        None,
     "power":        None,
-    "freq":         None,   # aktiv TX-frekvens (väljs automatiskt)
+    "freq":         None,   # aktiv TX-frekvens (väljs av användaren via RX-knapp)
     "freq_rx0":     None,   # VFO A på TRX 0
     "freq_rx1":     None,   # VFO A på TRX 1
-    "tx_trx":       0,      # vilket TRX som sänder (0 eller 1)
+    "tx_trx":       0,      # valt TRX för tune (0=RX1, 1=RX2) — sätts av GUI-knapp
     "timestamp":    0,
     "ser":          None,
     "active_radio": None,   # radio-dict för aktiv ingång
@@ -235,17 +235,9 @@ def _tci_url():
         radio  = radios[0] if radios else {}
     return f"ws://{radio.get('tci_host','127.0.0.1')}:{radio.get('tci_port', 50001)}"
 
-def set_freq(ws, freq):
-    trx = latest["tx_trx"]
-    ws.send(f"vfo:{trx},0,{freq};")
-
-def set_tx(ws, on):
-    trx = latest["tx_trx"]
-    ws.send(f"tune:{trx},true;" if on else f"tune:{trx},false;")
-
-def ensure_tx_ready(ws):
-    trx = latest["tx_trx"]
-    ws.send(f"modulation:{trx},CW;")
+def set_freq(ws, freq, trx):       ws.send(f"vfo:{trx},0,{freq};")
+def set_tx(ws, on, trx):           ws.send(f"tune:{trx},true;" if on else f"tune:{trx},false;")
+def ensure_tx_ready(ws, trx):      ws.send(f"modulation:{trx},CW;")
 
 # ──────────────────────────────────────────────────────────
 # CORE – BACKGROUND LOOPS
@@ -352,8 +344,7 @@ def tci_listener_loop(callback, running):
 
                 if msg.startswith("vfo:0,0,"):
                     try:
-                        freq = int(msg.rstrip(";").split(",")[2])
-                        latest["freq_rx0"] = freq
+                        latest["freq_rx0"] = int(msg.rstrip(";").split(",")[2])
                         latest["freq"] = _active_tx_freq()
                         callback("radio_freq", latest["freq"])
                     except (ValueError, IndexError):
@@ -361,25 +352,35 @@ def tci_listener_loop(callback, running):
 
                 elif msg.startswith("vfo:1,0,"):
                     try:
-                        freq = int(msg.rstrip(";").split(",")[2])
-                        latest["freq_rx1"] = freq
+                        latest["freq_rx1"] = int(msg.rstrip(";").split(",")[2])
                         latest["freq"] = _active_tx_freq()
                         callback("radio_freq", latest["freq"])
                     except (ValueError, IndexError):
                         pass
 
-                elif msg.startswith("tx_enable:"):
-                    # tx_enable:0,true; eller tx_enable:1,false;
+                elif msg.startswith("trx:"):
+                    # trx:N,true/false — faktisk TX-status per TRX
                     try:
                         parts = msg.rstrip(";").split(",")
                         trx = int(parts[0].split(":")[1])
-                        enabled = parts[1].strip().lower() == "true"
-                        if enabled:
+                        active = parts[1].strip().lower() == "true"
+                        if active:
                             latest["tx_trx"] = trx
                             latest["freq"] = _active_tx_freq()
                             callback("radio_freq", latest["freq"])
+                            callback("log", f"trx:{trx},true → TX RX{trx+1}")
                     except (ValueError, IndexError):
                         pass
+
+                elif msg.startswith("tx_frequency:"):
+                    # Exakt TX-frekvens från ExpertSDR
+                    try:
+                        freq = int(msg.rstrip(";").split(":")[1])
+                        latest["freq"] = freq
+                        callback("radio_freq", freq)
+                    except (ValueError, IndexError):
+                        pass
+
 
         except Exception as e:
             callback("log", f"TCI error: {type(e).__name__}: {e}")
@@ -387,7 +388,6 @@ def tci_listener_loop(callback, running):
         latest["freq"] = None
         latest["freq_rx0"] = None
         latest["freq_rx1"] = None
-        latest["tx_trx"] = 0
         callback("tci_status", "disconnected")
         callback("radio_freq", 0)
         if running["run"]:
@@ -419,9 +419,9 @@ def wait_for_tune(callback, timeout=10):
         time.sleep(0.02)
     return False
 
-def panic(ws, cb, msg):
+def panic(ws, cb, msg, trx=0):
     cb("error", msg)
-    try: set_tx(ws, False)
+    try: set_tx(ws, False, trx)
     except: pass
     stop_requested.clear()
     cb("done", None)
@@ -465,7 +465,9 @@ def manual_tune(callback):
         callback("error", "MANUAL TUNE FAIL: no serial connection")
         callback("done", None)
         return
-    freq = latest["freq"]
+    trx  = latest["tx_trx"]
+    freq = latest["freq_rx1"] if trx == 1 else latest["freq_rx0"]
+    callback("log", f"TUNE START: tx_trx={trx} freq_rx0={latest['freq_rx0']} freq_rx1={latest['freq_rx1']} → använder RX{trx+1} {freq}")
     if not freq:
         callback("error", "MANUAL TUNE FAIL: no frequency from radio")
         callback("done", None)
@@ -473,23 +475,23 @@ def manual_tune(callback):
 
     ws = websocket.create_connection(_tci_url(), timeout=5)
     try:
-        callback("status", f"MANUAL TUNE: {freq/1_000_000:.6f} MHz")
-        set_freq(ws, freq)
+        callback("status", f"MANUAL TUNE RX{trx+1}: {freq/1_000_000:.6f} MHz")
+        set_freq(ws, freq, trx)
         time.sleep(FREQ_SETTLE)
         ensure_standby(ws, callback)
         if not stop_requested.is_set():
-            ensure_tx_ready(ws)
-            set_tx(ws, True)
+            ensure_tx_ready(ws, trx)
+            set_tx(ws, True, trx)
             validate_rf(ws, callback)
             send_tune()
             if not wait_for_tune(callback):
                 if not stop_requested.is_set():
-                    panic(ws, callback, "TUNE FAIL: no tune cycle within timeout")
-            set_tx(ws, False)
+                    panic(ws, callback, "TUNE FAIL: no tune cycle within timeout", trx)
+            set_tx(ws, False, trx)
         else:
             callback("log", "Manual tune stopped")
     finally:
-        try: set_tx(ws, False)
+        try: set_tx(ws, False, trx)
         except: pass
         ws.close()
 
@@ -507,6 +509,7 @@ def run_tune(band, callback):
         callback("done", None)
         return
 
+    trx = latest["tx_trx"]
     start_f, end_f = BANDS[band]
     ws = websocket.create_connection(_tci_url(), timeout=5)
     try:
@@ -514,28 +517,28 @@ def run_tune(band, callback):
         while f <= end_f:
             if stop_requested.is_set():
                 callback("log", "Sweep stopped"); break
-            callback("status", f"Sweep {f/1_000_000:.3f} MHz")
-            set_freq(ws, f)
+            callback("status", f"Sweep RX{trx+1} {f/1_000_000:.3f} MHz")
+            set_freq(ws, f, trx)
             time.sleep(FREQ_SETTLE)
             ensure_standby(ws, callback)
             if stop_requested.is_set():
                 callback("log", "Sweep stopped"); break
-            ensure_tx_ready(ws)
-            set_tx(ws, True)
+            ensure_tx_ready(ws, trx)
+            set_tx(ws, True, trx)
             validate_rf(ws, callback)
             send_tune()
             if not wait_for_tune(callback):
                 if stop_requested.is_set():
-                    set_tx(ws, False)
+                    set_tx(ws, False, trx)
                     callback("log", "Sweep stopped"); break
-                panic(ws, callback, "TUNE FAIL: no tune cycle within timeout")
-            set_tx(ws, False)
+                panic(ws, callback, "TUNE FAIL: no tune cycle within timeout", trx)
+            set_tx(ws, False, trx)
             time.sleep(PAUSE_STEP)
             f += SWEEP_STEP
         if not stop_requested.is_set():
             callback("status", "DONE")
     finally:
-        try: set_tx(ws, False)
+        try: set_tx(ws, False, trx)
         except: pass
         ws.close()
 
@@ -718,7 +721,7 @@ class TunerGUI:
         self._locked      = False  # kontroller låsta pga okänd ingång
         self._swr_in_op   = False  # spårar om SWR-rutan visar Rev eller SWR
 
-        root.title("SM5K SPE Tuner v1.0.1")
+        root.title(f"SM5K SPE Tuner v1.0.2  {time.strftime('%H:%M')}")
         root.configure(bg=BG)
         root.resizable(False, False)
 
@@ -743,7 +746,6 @@ class TunerGUI:
                              relief="flat", font=("Consolas", 12),
                              cursor="hand2", bd=0,
                              command=lambda: SettingsDialog(self.root))
-
         self.tci_lbl.pack(side="left", padx=8, pady=3)
         self.serial_lbl.pack(side="left", padx=4, pady=3)
         cfg_btn.pack(side="right", padx=8, pady=2)
@@ -771,7 +773,7 @@ class TunerGUI:
         self.tx_lbl   = tk.Label(info, text="TX: OFF",   bg=BG, fg=MUTED, font=("Consolas", 10))
         self.band_lbl = tk.Label(info, text="Band: ---", bg=BG, fg=MUTED, font=("Consolas", 10))
         self.temp_lbl = tk.Label(info, text="Temp: ---", bg=BG, fg=MUTED, font=("Consolas", 10))
-        self.freq_lbl = tk.Label(info, text="",          bg=BG, fg=MUTED, font=("Consolas", 9))
+        self.freq_lbl = tk.Label(info, text="",          bg=BG, fg=TEXT,  font=("Consolas", 9))
         self.tx_lbl.pack(side="left", padx=(0,14))
         self.band_lbl.pack(side="left", padx=(0,14))
         self.temp_lbl.pack(side="left")
@@ -905,7 +907,7 @@ class TunerGUI:
     # ── Callback / kö ────────────────────────────────────────
 
     def callback(self, event, data): self.queue.put((event, data))
-    def _log(self, msg):             self.queue.put(("log", msg))
+    def _log(self, msg): self.queue.put(("log", msg))
 
     def process_queue(self):
         try:
@@ -930,12 +932,15 @@ class TunerGUI:
                         text=f"● {self._last_radio_name()}", fg=GREEN)
 
                 elif event == "log":
-                    self.log.insert(tk.END, f"{data}\n")
+                    ts = time.strftime("%H:%M:%S")
+                    self.log.insert(tk.END, f"{ts} {data}\n")
                     self.log.see(tk.END)
 
                 elif event == "radio_freq":
-                    self.freq_lbl.config(
-                        text=f"{data/1_000_000:.6f} MHz" if data else "")
+                    trx = latest["tx_trx"]
+                    rx_label = f"RX{trx+1}"
+                    display = f"{rx_label}  {data/1_000_000:.6f} MHz" if data else ""
+                    self.freq_lbl.config(text=display)
 
                 elif event == "tci_status":
                     ok = data == "connected"
