@@ -403,9 +403,16 @@ def tci_listener_loop(callback, running):
         if running["run"]:
             time.sleep(3)
 
-def start_telemetry(callback):
+def start_serial(callback):
     running = {"run": True}
-    threading.Thread(target=telemetry_loop,    args=(callback, running), daemon=True).start()
+    threading.Thread(target=telemetry_loop, args=(callback, running), daemon=True).start()
+    return running
+
+def stop_serial(running):
+    running["run"] = False
+
+def start_tci(callback):
+    running = {"run": True}
     threading.Thread(target=tci_listener_loop, args=(callback, running), daemon=True).start()
     return running
 
@@ -723,25 +730,74 @@ class SettingsDialog(tk.Toplevel):
         self.destroy()
 
 # ──────────────────────────────────────────────────────────
+# STÄNGNINGSDIALOG
+# ──────────────────────────────────────────────────────────
+
+class _CloseDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.result = "cancel"
+        self.title("Avsluta")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        tk.Label(self, text="Stäng av slutsteget?",
+                 bg=BG, fg=TEXT, font=("Consolas", 11, "bold"),
+                 pady=6).pack(padx=28, pady=(20, 4))
+
+        bkw = dict(relief="flat", font=("Consolas", 10), padx=14, pady=8, cursor="hand2")
+        f = tk.Frame(self, bg=BG, padx=20, pady=0)
+        f.pack(fill="x")
+
+        tk.Button(f, text="Stäng steget och avsluta",
+                  bg=STOPBG, fg=STOPFG,
+                  activebackground=STOPBG, activeforeground=STOPFG,
+                  command=lambda: self._set("yes"), **bkw).pack(fill="x", pady=3)
+        tk.Button(f, text="Avbryt — stanna kvar",
+                  bg=BG, fg=MUTED,
+                  activebackground=BORDER, activeforeground=TEXT,
+                  command=self.destroy, **bkw).pack(fill="x", pady=(3, 16))
+
+        self.wait_window()
+
+    def _set(self, result):
+        self.result = result
+        self.destroy()
+
+# ──────────────────────────────────────────────────────────
 # MAIN GUI
 # ──────────────────────────────────────────────────────────
 
 class TunerGUI:
     def __init__(self, root):
-        self.root         = root
-        self.queue        = queue.Queue()
-        self.running      = False
-        self._last_input  = None   # senast sedd ingång
-        self._locked      = False  # kontroller låsta pga okänd ingång
-        self._swr_in_op   = False  # spårar om SWR-rutan visar Rev eller SWR
+        self.root            = root
+        self.queue           = queue.Queue()
+        self.running         = False
+        self._last_input     = None
+        self._locked         = False
+        self._swr_in_op      = False
+        self._amp_connected  = False
+        self._serial_running = None
 
         root.title("SM5K SPE Tuner v1.0.4")
         root.configure(bg=BG)
         root.resizable(False, False)
 
-        self.running_flag = start_telemetry(self.callback)
+        self._tx_pending_since     = None
+        self._tx_on                = False
+        self._op_on                = False
+        self._op_raw_prev          = None
+        self._relay_settling_until = 0.0
+        self._band_pending         = None
+        self._alarm_pending_since  = None
+
+        self._tci_running = start_tci(self.callback)
         self._build_ui()
+        self._set_controls("disabled")
         root.update_idletasks()
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self.process_queue)
 
     # ── Layout ──────────────────────────────────────────────
@@ -755,7 +811,12 @@ class TunerGUI:
 
         self.tci_lbl    = tk.Label(bar, text="TCI: ---",    bg=BORDER, fg=MUTED, font=("Consolas", 9), width=14)
         self.serial_lbl = tk.Label(bar, text="Serial: ---", bg=BORDER, fg=MUTED, font=("Consolas", 9), width=14)
-        self.radio_lbl  = tk.Label(bar, text="",            bg=BORDER, fg=MUTED, font=("Consolas", 9), anchor="e", width=22)
+        self.radio_lbl  = tk.Label(bar, text="",            bg=BORDER, fg=MUTED, font=("Consolas", 9), anchor="e", width=14)
+        self.amp_btn = tk.Button(bar, text="AMP: OFF", bg=BORDER, fg=RED,
+                                  activebackground=BORDER, activeforeground=TEXT,
+                                  relief="flat", font=("Consolas", 9),
+                                  width=8, bd=0,
+                                  command=self._toggle_amp)
         cfg_btn = tk.Button(bar, text="⚙", bg=BORDER, fg=MUTED,
                              activebackground=BORDER, activeforeground=TEXT,
                              relief="flat", font=("Consolas", 12),
@@ -763,6 +824,7 @@ class TunerGUI:
                              command=lambda: SettingsDialog(self.root))
         self.tci_lbl.pack(side="left", padx=8, pady=3)
         self.serial_lbl.pack(side="left", padx=4, pady=3)
+        self.amp_btn.pack(side="left", padx=4, pady=3)
         cfg_btn.pack(side="right", padx=8, pady=2)
         self.radio_lbl.pack(side="right", padx=4, pady=3, fill="x", expand=True)
 
@@ -863,9 +925,80 @@ class TunerGUI:
         self._log(f"TX RX manuellt → RX{latest['tx_trx']+1}")
         self.queue.put(("radio_freq", latest["freq"]))
 
-    def toggle_mode(self):   toggle_operate();    self._log("Toggle Mode")
-    def next_ant(self):      next_antenna();      self._log("Next ANT")
+    def _apply_op_state(self, op):
+        if op != self._swr_in_op:
+            self._swr_in_op = op
+            if op:
+                self.swr_meter._hdr.config(text="REF POWER")
+                self.swr_meter._max        = 200
+                self.swr_meter._thresholds = [(60, AMBER), (150, RED)]
+            else:
+                self.swr_meter._hdr.config(text="SWR")
+                self.swr_meter._max        = 3.0
+                self.swr_meter._thresholds = [(1.5, AMBER), (2.5, RED)]
+            self.swr_meter.clear()
+        self.mode_btn.config(
+            text="Mode: OPERATE" if op else "Mode: STANDBY",
+            bg=AMBER if op else BTNBG,
+            fg=BG    if op else BTNFG,
+            activebackground=AMBER  if op else BORDER,
+            activeforeground=BG     if op else TEXT)
+
+    def toggle_mode(self):
+        toggle_operate()
+        self._log("Toggle Mode")
+        expected = not self._op_on
+        self._op_on       = expected
+        self._op_raw_prev = expected
+        self._relay_settling_until = time.monotonic() + 0.5
+        self._apply_op_state(expected)
+
+    def next_ant(self):
+        next_antenna()
+        self._log("Next ANT")
+        self._relay_settling_until = time.monotonic() + 0.5
+
     def toggle_power(self):  toggle_power_mode(); self._log("Toggle Power Mode")
+
+    def _amp_connect(self):
+        self._amp_connected  = True
+        self._last_input     = None
+        self._serial_running = start_serial(self.callback)
+        self.amp_btn.config(text="AMP: ON", fg=GREEN)
+        if not self._locked:
+            self._set_controls("normal")
+        self._log("AMP ON")
+
+    def _amp_disconnect(self):
+        self._amp_connected = False
+        if self._serial_running:
+            stop_serial(self._serial_running)
+            self._serial_running = None
+        latest["flags"] = None
+        self._op_on       = False
+        self._op_raw_prev = None
+        self.serial_lbl.config(text="Serial: ---", fg=MUTED)
+        self.amp_btn.config(text="AMP: OFF", fg=RED)
+        self.mode_btn.config(text="Mode: ---", bg=BTNBG, fg=BTNFG,
+                             activebackground=BORDER, activeforeground=TEXT)
+        self._set_controls("disabled")
+        self._log("AMP OFF")
+
+    def _toggle_amp(self):
+        if self._amp_connected:
+            self._amp_disconnect()
+        else:
+            self._amp_connect()
+
+    def _on_close(self):
+        if self._amp_connected:
+            dlg = _CloseDialog(self.root)
+            if dlg.result == "cancel":
+                return
+            self._amp_disconnect()
+            time.sleep(1.0)
+        self._tci_running["run"] = False
+        self.root.destroy()
 
     def _on_tune_single(self):
         if self.running: return
@@ -985,8 +1118,17 @@ class TunerGUI:
                     else:
                         self.power_meter.clear()
 
+                    # TX — 400 ms debounce mot falskt TX-flimmer
                     if "tx" in data:
-                        on = data["tx"]
+                        raw_tx = data["tx"]
+                        if raw_tx:
+                            if self._tx_pending_since is None:
+                                self._tx_pending_since = time.monotonic()
+                            on = (time.monotonic() - self._tx_pending_since) >= 0.40
+                        else:
+                            self._tx_pending_since = None
+                            on = False
+                        self._tx_on = on
                         self.tx_lbl.config(
                             text="● TX ON" if on else "TX: OFF",
                             bg=RED if on else BG,
@@ -994,33 +1136,39 @@ class TunerGUI:
                         self.power_meter.highlight(on)
                         self.swr_meter.highlight(on)
 
+                    # Band — 500 ms debounce
                     if "band" in data and data["band"]:
-                        self.band_lbl.config(text=f"Band: {data['band']}", fg=TEXT)
+                        b = data["band"]
+                        if self._band_pending is None or self._band_pending[0] != b:
+                            self._band_pending = (b, time.monotonic())
+                        elif time.monotonic() - self._band_pending[1] >= 0.50:
+                            self.band_lbl.config(text=f"Band: {b}", fg=TEXT)
 
                     if "temp" in data and data["temp"] is not None:
                         t    = data["temp"]
                         unit = data.get("temp_unit", "°C")
-                        tc   = RED if t >= 83 else (AMBER if t >= 70 else TEXT)
+                        t_c  = (t - 32) / 1.8 if unit == "°F" else t
+                        tc   = RED if t_c >= 83 else (AMBER if t_c >= 70 else TEXT)
                         self.temp_lbl.config(text=f"Temp: {t}{unit}", fg=tc)
 
-                    # SWR-mätaren visar SWR i STANDBY och Rev power i OPERATE.
-                    # Protokollet garanterar att de aldrig är aktiva samtidigt.
-                    op = data.get("op", False)
-                    if op != self._swr_in_op:
-                        self._swr_in_op = op
-                        if op:
-                            self.swr_meter._hdr.config(text="REF POWER")
-                            self.swr_meter._max        = 200
-                            self.swr_meter._thresholds = [(60, AMBER), (150, RED)]
-                        else:
-                            self.swr_meter._hdr.config(text="SWR")
-                            self.swr_meter._max        = 3.0
-                            self.swr_meter._thresholds = [(1.5, AMBER), (2.5, RED)]
-                        self.swr_meter.clear()
+                    # OP — 2-pakets-konsensus + settling-fönster
+                    if "op" in data:
+                        raw_op = data["op"]
+                        if time.monotonic() >= self._relay_settling_until:
+                            if self._op_raw_prev is None:
+                                if raw_op != self._op_on:
+                                    self._op_on = raw_op
+                                    self._apply_op_state(raw_op)
+                            elif raw_op == self._op_raw_prev and raw_op != self._op_on:
+                                self._op_on = raw_op
+                                self._apply_op_state(raw_op)
+                        self._op_raw_prev = raw_op
+                    op = self._op_on
 
+                    # SWR/REF POWER
                     if op:
                         rev = data.get("reflected", 0.0)
-                        if data.get("tx") and rev and rev > 0.0:
+                        if self._tx_on and rev and rev > 0.0:
                             self.swr_meter.set(rev, f"{rev:.1f} W")
                         else:
                             self.swr_meter.clear()
@@ -1031,7 +1179,15 @@ class TunerGUI:
                         else:
                             self.swr_meter.clear()
 
-                    alarm   = data.get("alarm", False)
+                    # Alarm — 400 ms debounce
+                    raw_alarm = data.get("alarm", False)
+                    if raw_alarm:
+                        if self._alarm_pending_since is None:
+                            self._alarm_pending_since = time.monotonic()
+                        alarm = (time.monotonic() - self._alarm_pending_since) >= 0.40
+                    else:
+                        self._alarm_pending_since = None
+                        alarm = False
                     warning = data.get("warning")
                     if alarm:
                         msg = warning if warning else "ALARM"
@@ -1041,15 +1197,6 @@ class TunerGUI:
                         self.log.see(tk.END)
                     else:
                         self.alarm_lbl.pack_forget()
-
-                    if "op" in data:
-                        op = data["op"]
-                        self.mode_btn.config(
-                            text="Mode: OPERATE" if op else "Mode: STANDBY",
-                            bg=AMBER if op else BTNBG,
-                            fg=BG    if op else BTNFG,
-                            activebackground=AMBER  if op else BORDER,
-                            activeforeground=BG     if op else TEXT)
 
                     if "ant" in data and data["ant"] is not None:
                         self.ant_btn.config(text=f"ANT: {data['ant']}")
