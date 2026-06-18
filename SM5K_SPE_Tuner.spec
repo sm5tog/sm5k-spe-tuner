@@ -36,3 +36,8 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
+import shutil, os
+_dst = r"C:\claude\aktiv\tune"
+os.makedirs(_dst, exist_ok=True)
+shutil.copy(os.path.join(DISTPATH, "SM5K_SPE_Tuner.exe"), os.path.join(_dst, "SM5K_SPE_Tuner.exe"))

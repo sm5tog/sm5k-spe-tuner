@@ -124,7 +124,10 @@ WARNINGS = {
 latest = {
     "flags":        None,
     "power":        None,
-    "freq":         None,
+    "freq":         None,   # aktiv TX-frekvens (väljs automatiskt)
+    "freq_rx0":     None,   # VFO A på TRX 0
+    "freq_rx1":     None,   # VFO A på TRX 1
+    "tx_trx":       0,      # vilket TRX som sänder (0 eller 1)
     "timestamp":    0,
     "ser":          None,
     "active_radio": None,   # radio-dict för aktiv ingång
@@ -232,9 +235,17 @@ def _tci_url():
         radio  = radios[0] if radios else {}
     return f"ws://{radio.get('tci_host','127.0.0.1')}:{radio.get('tci_port', 50001)}"
 
-def set_freq(ws, freq):       ws.send(f"vfo:0,0,{freq};")
-def set_tx(ws, on):           ws.send("tune:0,true;" if on else "tune:0,false;")
-def ensure_tx_ready(ws):      ws.send("modulation:0,CW;")
+def set_freq(ws, freq):
+    trx = latest["tx_trx"]
+    ws.send(f"vfo:{trx},0,{freq};")
+
+def set_tx(ws, on):
+    trx = latest["tx_trx"]
+    ws.send(f"tune:{trx},true;" if on else f"tune:{trx},false;")
+
+def ensure_tx_ready(ws):
+    trx = latest["tx_trx"]
+    ws.send(f"modulation:{trx},CW;")
 
 # ──────────────────────────────────────────────────────────
 # CORE – BACKGROUND LOOPS
@@ -309,6 +320,13 @@ def telemetry_loop(callback, running):
         if running["run"]:
             time.sleep(3)
 
+def _active_tx_freq():
+    """Returnerar frekvensen för det TRX som för tillfället sänder."""
+    trx = latest["tx_trx"]
+    if trx == 1:
+        return latest["freq_rx1"] or latest["freq_rx0"]
+    return latest["freq_rx0"] or latest["freq_rx1"]
+
 def tci_listener_loop(callback, running):
     while running["run"]:
         url = _tci_url()
@@ -316,7 +334,9 @@ def tci_listener_loop(callback, running):
             ws = websocket.create_connection(url, timeout=5)
             ws.settimeout(30)
             callback("tci_status", "connected")
+            # Begär startfrekvens för båda TRX
             ws.send("vfo:0,0;")
+            ws.send("vfo:1,0;")
 
             while running["run"]:
                 # Byt anslutning om aktiv radio ändrats
@@ -327,13 +347,37 @@ def tci_listener_loop(callback, running):
                     msg = ws.recv()
                 except (websocket.WebSocketTimeoutException, socket.timeout):
                     ws.send("vfo:0,0;")
+                    ws.send("vfo:1,0;")
                     continue
 
                 if msg.startswith("vfo:0,0,"):
                     try:
                         freq = int(msg.rstrip(";").split(",")[2])
-                        latest["freq"] = freq
-                        callback("radio_freq", freq)
+                        latest["freq_rx0"] = freq
+                        latest["freq"] = _active_tx_freq()
+                        callback("radio_freq", latest["freq"])
+                    except (ValueError, IndexError):
+                        pass
+
+                elif msg.startswith("vfo:1,0,"):
+                    try:
+                        freq = int(msg.rstrip(";").split(",")[2])
+                        latest["freq_rx1"] = freq
+                        latest["freq"] = _active_tx_freq()
+                        callback("radio_freq", latest["freq"])
+                    except (ValueError, IndexError):
+                        pass
+
+                elif msg.startswith("tx_enable:"):
+                    # tx_enable:0,true; eller tx_enable:1,false;
+                    try:
+                        parts = msg.rstrip(";").split(",")
+                        trx = int(parts[0].split(":")[1])
+                        enabled = parts[1].strip().lower() == "true"
+                        if enabled:
+                            latest["tx_trx"] = trx
+                            latest["freq"] = _active_tx_freq()
+                            callback("radio_freq", latest["freq"])
                     except (ValueError, IndexError):
                         pass
 
@@ -341,6 +385,9 @@ def tci_listener_loop(callback, running):
             callback("log", f"TCI error: {type(e).__name__}: {e}")
 
         latest["freq"] = None
+        latest["freq_rx0"] = None
+        latest["freq_rx1"] = None
+        latest["tx_trx"] = 0
         callback("tci_status", "disconnected")
         callback("radio_freq", 0)
         if running["run"]:
