@@ -24,10 +24,27 @@
 - `pkt[5] & 0b10000` satt = **HIGH** (inte LOW som man kan tro)
 - Verifierat mot hårdvara — ändra inte utan test
 
-### tx_enable vs trx:
-- `tx_enable:N,true/false` i TCI är **opålitlig** — ExpertSDR skickar den konstant för intern routing
-- Använd **alltid `trx:N,true/false`** för TX-detektering
-- Både true och false måste hanteras — annars fastnar `tx_trx` på fel RX
+### tx_trx-detektering — KRITISK, ändra inte utan att ha testat båda radiorna
+
+`tx_trx` (0=RX1, 1=RX2) bestäms av TCI via **tre källor** i prioritetsordning:
+
+1. **`tune:N,true`** — ExpertSDR skickar detta när tune startar på TRX N. Mest omedelbar signal. Sätt `tx_trx = N` direkt.
+
+2. **`tx_sensors:N,...,power_peak,...`** — ExpertSDR skickar TX-parametrar med TRX-nummer och effekt. Sätt `tx_trx = N` om `power_peak > 1W`. Fungerar för både hårdvaru-keyer och macro-CW. Aktiveras med `tx_sensors_enable:true,100;` vid anslutning.
+
+3. **`trx:N,true`** — Skickas av ExpertSDR vid macro-CW och DIGU men **inte alltid** vid hårdvaru-keyer CW. Sätt `tx_trx = N` vid true. False ignoreras för tx_trx (ändrar bara `trx_active`-dicten).
+
+**Vad som INTE fungerar:**
+- `tx_enable:N,true/false` — opålitlig, ExpertSDR skickar den för intern routing, TRX-numret stämmer inte med aktiv radio
+- RS232 active_input (byte [18]) — steget rapporterar vilken ingång som är aktiv, inte radion. Ska **inte** användas för tx_trx.
+- "lowest active wins" på trx_active — ExpertSDR skickar ofta `trx:0,true` oavsett vilket TRX som sänder, vilket alltid ger tx_trx=0
+
+**Varför tre källor behövs:**
+- CW hårdvaru-keyer → ExpertSDR skickar ALDRIG `trx:1,true` för RX2. Bara `tx_sensors` fångar det.
+- Tune → ExpertSDR skickar `tune:N,true` direkt. `tx_sensors` kommer en bråkdel senare.
+- DIGU/FT8 → `trx:N,true` fungerar korrekt.
+
+**Manuell override:** klick på RX1/RX2-etiketten (`_toggle_rx()`) togglar tx_trx direkt. Används när auto-detektering av något skäl inte hunnit uppdatera.
 
 ### PyInstaller cache
 - `pyinstaller spec` utan `--clean` kan använda cachad EXE och INTE bygga om
@@ -94,12 +111,15 @@ latest = {
 ---
 
 ## Dual-RX TX-tracking
-- `trx_active[N]` uppdateras för varje `trx:N,true/false`
-- `tx_trx` = lägst index i `trx_active` som är True; om ingen sänder behålls senaste
+- `tx_trx` uppdateras från tre TCI-källor (se fallgropar ovan för fullständig beskrivning):
+  1. `tune:N,true` → `tx_trx = N` (omedelbart vid tune-start)
+  2. `tx_sensors:N,...,power_peak,...` → `tx_trx = N` om power_peak > 1W (fungerar för keyer+macro)
+  3. `trx:N,true` → `tx_trx = N` (fungerar för macro/DIGU, inte alltid för keyer)
+- `trx_active[N]` uppdateras för varje `trx:N,true/false` men styr **inte** tx_trx vid false
+- `tx_sensors_enable:true,100;` skickas vid TCI-anslutning för att aktivera TX_SENSORS
 - `_active_tx_freq()` returnerar rätt frekvens baserat på `tx_trx`
-- **OBS**: ExpertSDR:s interna tuner på RX2 skickar `trx:1,true` — utan false-hantering
-  fastnar tunern på RX2 även vid sändning på RX1. Bägge true/false måste hanteras.
-- Vid TCI-disconnect: `trx_active` nollställs
+- `_toggle_rx()` — manuell override via klick på RX1/RX2-etiketten
+- Vid TCI-disconnect: `trx_active` nollställs, tx_trx behålls
 
 ---
 
@@ -253,6 +273,63 @@ BANDS = {
 
 ---
 
+## Effektreglering
+
+### Syfte
+Håller utgångseffekten konstant på inställt börvärde (separat för CW och DIGU)
+oavsett band, antenn och driftsförhållanden. Aktiveras med REG-knappen.
+
+### Börvärden
+- Lagras i `cfg["target_power"]` per mode: `{"CW": 300, "DIGU": 300}`
+- Justeras med +/− knapparna (steg 10W). Gäller alla band.
+- Framtida: separata börvärden per band (HIGH/LOW-inställning på steget)
+
+### Feed-forward (FF)
+- Vid varje TX-start interpoleras ett känt drivenivåvärde ur inlärd kurva
+- Kurvan (`cfg["drive_curve"]`) lagrar `{band: {drive: uppmätt_effekt}}`
+- Interpolering: linjär mellan närmaste kända punkter
+- Om kurva saknas → hoppa direkt till FAS1
+
+### Mätning och filtrering
+- `measured_w` läses från RS232-telemetri (byte [26-27], 10× W)
+- `min_w = max(50, target - 100)` — dynamisk undregräns filtrerar CW inter-element-glapp
+- `is_transient = measured_w > target + 100` — överskjutning mer än 100W = transient
+- `is_valid = min_w <= measured_w <= target + 100` — mätpunkt räknas in i medelvärde
+
+### Regleringsfaser
+
+**FAS1 — Aktiv sökning**
+- Samlar 4 mätpunkter (rullande buffer, ~2s vid 2Hz mätfrekvens)
+- Beräknar medelvärde och fel (avg − target)
+- Inom ±10W och stabilt i 2s → spara kurv-punkt, gå till FAS2
+- Utanför → proportionell justering:
+  - Fel >80W: steg=4, intervall=150ms
+  - Fel >40W: steg=3, intervall=200ms
+  - Fel >20W: steg=2, intervall=300ms
+  - Annars:  steg=1, intervall=500ms
+- Historik rensas atomärt vid varje drive-ändring (undviker gammalt brus)
+
+**FAS2 — Långsam underhållsreglering**
+- Samlar 50 mätpunkter (~25s)
+- Om snitt inom ±10W → stabil, fortsätt
+- Annars → spara kurv-punkt, justera 1 steg, tillbaka till FAS1
+
+### Överskyddsfunktion (SKYDD)
+- Vid 3+ transienter i rad (även utan historik): minska drive omedelbart
+- Återgår till FAS1 efter skyddsåtgärd
+
+### Tillståndsåterställning
+- TX av → rensa historik, nollställ ff_applied och phase2
+- Börvärdesbyte → samma återställning
+- Drive-ändring (`set_drive()`) → rensa historik atomärt
+
+### Loggning
+`reg_log.csv` skapas bredvid EXE med kolumner:
+`time, phase, band, mode, target, measured, avg, drive, new_drive, action`
+Faserna: FF, TRANSIENT, SKYDD, FAS1, FAS1-stabil, FAS1-väntar, FAS1-just, FAS1→FAS2, FAS2, FAS2-OK, FAS2-drift
+
+---
+
 ## Ingångshantering
 - RS232-telemetri rapporterar aktiv ingång (`get_input(pkt)`)
 - `find_radio(inp)` matchar mot konfigurerade radios
@@ -292,3 +369,4 @@ python -m PyInstaller SM5K_SPE_Tuner.spec
 - v1.0.2: AMP ON/OFF via DTR (start_serial/stop_serial), OP-debounce (2-pakets-konsensus + settling), TX/band/alarm-debounce, stängdialog, optimistisk GUI-uppdatering
 - v1.0.3: Lika stora tune-knappar, fast fönsterstorlek, frekvensåterställning efter sweep, dual-RX frekvensvisning med RX-prefix
 - v1.0.4: Dual-RX TX-tracking via `trx:N,true/false`, `trx_active`-dict, AMP ON/OFF återinförd korrekt, OP-debounce återinförd, HIGH/LOW power-fix
+- v1.0.5: Effektreglering (CW/DIGU), feed-forward kurva, FAS1/FAS2, TX-TRX-detektering via `tx_sensors` + `tune:N,true`

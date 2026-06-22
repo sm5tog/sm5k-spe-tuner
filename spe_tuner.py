@@ -1,5 +1,5 @@
 ## ==========================================================
-## SM5K SPE Tuner v1.0.4
+## SM5K SPE Tuner v1.1.0
 ## SPE Expert 1K-FA controller – Single file | In-app settings
 ## Author: SM5K (SM5TOG)
 ## ==========================================================
@@ -8,6 +8,8 @@ import tkinter as tk
 import threading
 import queue
 import time
+import logging
+from collections import deque
 import json
 import os
 import socket
@@ -22,6 +24,8 @@ DEFAULT_RADIO = {"name": "", "input": 1, "tci_host": "127.0.0.1", "tci_port": 50
 
 DEFAULT_CONFIG = {
     "serial_port": "COM6",
+    "target_power": {"CW": 300, "DIGU": 300},
+    "drive_curve":  {},   # {band: {drive: power}} — gemensam för alla modes
     "radios": [
         {"name": "Radio 1", "input": 1, "tci_host": "127.0.0.1", "tci_port": 50001},
         {"name": "Radio 2", "input": 2, "tci_host": "127.0.0.1", "tci_port": 40001},
@@ -72,6 +76,21 @@ def load_config():
                 result["serial_port"] = saved["serial_port"]
             if "radios" in saved:
                 result["radios"] = saved["radios"]
+            if "target_power" in saved:
+                tp = saved["target_power"]
+                if isinstance(tp, dict):
+                    result["target_power"] = {
+                        "CW":   int(tp.get("CW",   300)),
+                        "DIGU": int(tp.get("DIGU", 300)),
+                    }
+                else:
+                    # Migrering från gammalt format (ett int-värde)
+                    result["target_power"] = {"CW": int(tp), "DIGU": int(tp)}
+            if "drive_curve" in saved:
+                result["drive_curve"] = {
+                    band: {int(k): float(v) for k, v in pts.items()}
+                    for band, pts in saved["drive_curve"].items()
+                }
             return result
     except (FileNotFoundError, json.JSONDecodeError):
         return json.loads(json.dumps(DEFAULT_CONFIG))
@@ -81,6 +100,15 @@ def save_config(c):
         json.dump(c, f, indent=2)
 
 cfg = load_config()
+
+# Reglerings-logg
+_log_path = os.path.join(os.path.dirname(_cfg_path), "reg_log.csv")
+_reg_logger = logging.getLogger("reg")
+_reg_logger.setLevel(logging.DEBUG)
+_fh = logging.FileHandler(_log_path, mode="w", encoding="utf-8")
+_fh.setFormatter(logging.Formatter("%(message)s"))
+_reg_logger.addHandler(_fh)
+_reg_logger.info("time,phase,band,mode,target,measured,avg,drive,new_drive,action")
 
 def find_radio(input_nr):
     """Returnerar radio-dict för given ingång, eller None om okänd."""
@@ -128,11 +156,20 @@ latest = {
     "freq_rx0":     None,   # VFO A på TRX 0
     "freq_rx1":     None,   # VFO A på TRX 1
     "tx_trx":       0,      # aktivt TX-TRX (0=RX1, 1=RX2)
-    "trx_active":   {0: False, 1: False},  # vilka TRX som för tillfället sänder
+    "trx_active":   {0: False, 1: False},
+    "modulation":   {0: None, 1: None},
+    "drive":        {0: 100, 1: 100},
+    "tune_drive":   {0: 100, 1: 100},
+    "tune_active":  {0: False, 1: False},
     "timestamp":    0,
     "ser":          None,
-    "active_radio": None,   # radio-dict för aktiv ingång
+    "active_radio": None,
 }
+
+tci_cmd_queue = queue.Queue()  # kommandon att skicka via TCI-anslutningen
+
+def send_tci_cmd(cmd):
+    tci_cmd_queue.put(cmd)
 
 stop_requested = threading.Event()
 
@@ -325,12 +362,19 @@ def tci_listener_loop(callback, running):
         url = _tci_url()
         try:
             ws = websocket.create_connection(url, timeout=5)
-            ws.settimeout(30)
+            ws.settimeout(0.15)
             callback("tci_status", "connected")
-            # Begär startfrekvens för båda TRX
             ws.send("vfo:0,0;")
             ws.send("vfo:1,0;")
+            ws.send("modulation:0;")
+            ws.send("modulation:1;")
+            ws.send("drive:0;")
+            ws.send("drive:1;")
+            ws.send("tune_drive:0;")
+            ws.send("tune_drive:1;")
+            ws.send("tx_sensors_enable:true,100;")
 
+            _keepalive_ticks = 0
             while running["run"]:
                 # Byt anslutning om aktiv radio ändrats
                 if _tci_url() != url:
@@ -338,9 +382,19 @@ def tci_listener_loop(callback, running):
 
                 try:
                     msg = ws.recv()
+                    _keepalive_ticks = 0
                 except (websocket.WebSocketTimeoutException, socket.timeout):
-                    ws.send("vfo:0,0;")
-                    ws.send("vfo:1,0;")
+                    # Töm utgående kö även om inga inkommande meddelanden
+                    while not tci_cmd_queue.empty():
+                        try:
+                            ws.send(tci_cmd_queue.get_nowait())
+                        except Exception:
+                            pass
+                    _keepalive_ticks += 1
+                    if _keepalive_ticks >= 200:   # ~30 s
+                        ws.send("vfo:0,0;")
+                        ws.send("vfo:1,0;")
+                        _keepalive_ticks = 0
                     continue
 
                 if msg.startswith("vfo:0,0,"):
@@ -366,15 +420,8 @@ def tci_listener_loop(callback, running):
                         trx = int(parts[0].split(":")[1])
                         active = parts[1].strip().lower() == "true"
                         latest["trx_active"][trx] = active
-                        # Välj aktivt TX-TRX: lägst index som sänder, annars behåll
-                        if latest["trx_active"][0]:
-                            new_trx = 0
-                        elif latest["trx_active"][1]:
-                            new_trx = 1
-                        else:
-                            new_trx = latest["tx_trx"]  # ingen sänder — behåll
-                        if new_trx != latest["tx_trx"]:
-                            latest["tx_trx"] = new_trx
+                        if active:
+                            latest["tx_trx"] = trx
                             latest["freq"] = _active_tx_freq()
                             callback("radio_freq", latest["freq"])
                         callback("log", f"trx:{trx},{str(active).lower()} → TX RX{latest['tx_trx']+1}")
@@ -382,7 +429,6 @@ def tci_listener_loop(callback, running):
                         pass
 
                 elif msg.startswith("tx_frequency:"):
-                    # Exakt TX-frekvens från ExpertSDR
                     try:
                         freq = int(msg.rstrip(";").split(":")[1])
                         latest["freq"] = freq
@@ -390,6 +436,69 @@ def tci_listener_loop(callback, running):
                     except (ValueError, IndexError):
                         pass
 
+                elif msg.startswith("modulation:"):
+                    try:
+                        parts = msg.rstrip(";").split(",")
+                        trx  = int(parts[0].split(":")[1])
+                        mode = parts[1].strip().upper()
+                        latest["modulation"][trx] = mode
+                        callback("modulation", (trx, mode))
+                    except (ValueError, IndexError):
+                        pass
+
+                elif msg.startswith("drive:"):
+                    try:
+                        parts = msg.rstrip(";").split(",")
+                        trx  = int(parts[0].split(":")[1])
+                        val  = int(parts[1])
+                        latest["drive"][trx] = val
+                    except (ValueError, IndexError):
+                        pass
+
+                elif msg.startswith("tune_drive:"):
+                    try:
+                        parts = msg.rstrip(";").split(",")
+                        trx  = int(parts[0].split(":")[1])
+                        val  = int(parts[1])
+                        latest["tune_drive"][trx] = val
+                    except (ValueError, IndexError):
+                        pass
+
+                elif msg.startswith("tx_sensors:"):
+                    # tx_sensors:N,mic,power_rms,power_peak,swr
+                    # Pålitlig detektering av aktivt TX-TRX — fungerar för både macro och keyer
+                    try:
+                        parts = msg.rstrip(";").split(",")
+                        trx   = int(parts[0].split(":")[1])
+                        power = float(parts[3])   # power_peak W
+                        if power > 1.0 and trx != latest["tx_trx"]:
+                            latest["tx_trx"] = trx
+                            latest["freq"] = _active_tx_freq()
+                            callback("radio_freq", latest["freq"])
+                            callback("log", f"tx_sensors:{trx} power={power:.0f}W → TX RX{trx+1}")
+                    except (ValueError, IndexError):
+                        pass
+
+                elif msg.startswith("tune:"):
+                    try:
+                        parts = msg.rstrip(";").split(",")
+                        trx    = int(parts[0].split(":")[1])
+                        active = parts[1].strip().lower() == "true"
+                        latest["tune_active"][trx] = active
+                        if active and trx != latest["tx_trx"]:
+                            latest["tx_trx"] = trx
+                            latest["freq"] = _active_tx_freq()
+                            callback("radio_freq", latest["freq"])
+                            callback("log", f"tune:{trx},true → TX RX{trx+1}")
+                    except (ValueError, IndexError):
+                        pass
+
+                # Skicka väntande utgående kommandon
+                while not tci_cmd_queue.empty():
+                    try:
+                        ws.send(tci_cmd_queue.get_nowait())
+                    except Exception:
+                        pass
 
         except Exception as e:
             callback("log", f"TCI error: {type(e).__name__}: {e}")
@@ -781,7 +890,7 @@ class TunerGUI:
         self._amp_connected  = False
         self._serial_running = None
 
-        root.title("SM5K SPE Tuner v1.0.4")
+        root.title("SM5K SPE Tuner v1.1.0")
         root.configure(bg=BG)
         root.resizable(False, False)
 
@@ -792,6 +901,15 @@ class TunerGUI:
         self._relay_settling_until = 0.0
         self._band_pending         = None
         self._alarm_pending_since  = None
+        self._current_band         = None
+        self._reg_last_adjust      = 0.0
+        self._reg_stable_since     = None
+        self._reg_ff_applied       = False
+        self._reg_last_target      = None
+        self._reg_phase2           = False   # True = underhållsfas (lång mätning)
+        self._power_history        = deque(maxlen=10)   # fas 1: ~2s
+        self._power_history_slow   = deque(maxlen=50)   # fas 2: ~10s
+        self._power_display        = deque(maxlen=3)    # utjämning för display
 
         self._tci_running = start_tci(self.callback)
         self._build_ui()
@@ -837,6 +955,30 @@ class TunerGUI:
         self.power_meter.pack(side="left", expand=True, fill="both")
         tk.Frame(self._meters_frame, bg=BORDER, width=1).pack(side="left", fill="y", pady=8)
         self.swr_meter.pack(side="left", expand=True, fill="both")
+
+        # Effektbörvärde (under POWER-metern)
+        self._reg_frame = tk.Frame(r, bg=PANEL, pady=3)
+        self._reg_frame.pack(fill="x")
+        tk.Frame(self._reg_frame, bg=BORDER, height=1).pack(fill="x")
+        reg_row = tk.Frame(self._reg_frame, bg=PANEL)
+        reg_row.pack()
+        bk_small = dict(bg=BTNBG, fg=BTNFG, relief="flat",
+                        font=("Consolas", 9), activebackground=BORDER,
+                        activeforeground=TEXT, padx=4, pady=1)
+        self._reg_minus = tk.Button(reg_row, text="−", width=2,
+                                     command=self._reg_decrease, **bk_small)
+        self._reg_lbl   = tk.Label(reg_row, text="300W", bg=PANEL, fg=TEXT,
+                                    font=("Consolas", 9, "bold"), width=6)
+        self._reg_plus  = tk.Button(reg_row, text="+", width=2,
+                                     command=self._reg_increase, **bk_small)
+        self._reg_btn   = tk.Button(reg_row, text="●", width=2,
+                                     command=self._reg_toggle, **bk_small)
+        self._reg_minus.pack(side="left", padx=(0,2))
+        self._reg_lbl.pack(side="left")
+        self._reg_plus.pack(side="left", padx=(2,6))
+        self._reg_btn.pack(side="left")
+        self._reg_active = True
+        self._reg_update_label()
 
         # Larmbanners (dolda till de behövs)
         self.alarm_lbl = tk.Label(r, text="", bg=RED, fg="white",
@@ -924,6 +1066,268 @@ class TunerGUI:
         latest["freq"] = _active_tx_freq()
         self._log(f"TX RX manuellt → RX{latest['tx_trx']+1}")
         self.queue.put(("radio_freq", latest["freq"]))
+
+    # ── Effektreglering ──────────────────────────────────────
+
+    def _curve_interpolate(self, band, target_w):
+        """Returnerar interpolerat drive-värde för target_w från kurvan, eller None."""
+        pts = cfg["drive_curve"].get(band)
+        if not pts or len(pts) < 2:
+            return None
+        pairs = sorted(pts.items())   # [(drive, power), ...]
+        # Hitta omgivande punkter
+        for i in range(len(pairs) - 1):
+            d0, p0 = pairs[i]
+            d1, p1 = pairs[i + 1]
+            if p0 <= target_w <= p1 or p1 <= target_w <= p0:
+                if p1 == p0:
+                    return d0
+                t = (target_w - p0) / (p1 - p0)
+                return int(round(d0 + t * (d1 - d0)))
+        # Utanför kurvan — extrapolera från närmaste ände
+        d0, p0 = pairs[0];  d1, p1 = pairs[-1]
+        if target_w < min(p0, p1):
+            d, p = (d0, p0) if p0 < p1 else (d1, p1)
+            return max(0, min(100, d - 2))
+        else:
+            d, p = (d1, p1) if p1 > p0 else (d0, p0)
+            return max(0, min(100, d + 2))
+
+    def _curve_add_point(self, band, drive, power_w):
+        """Lägger till eller uppdaterar en kurv-punkt och sparar."""
+        curve = cfg["drive_curve"].setdefault(band, {})
+        # Slå ihop med befintlig punkt om drive är samma
+        existing = curve.get(drive)
+        if existing is not None:
+            curve[drive] = round(0.7 * existing + 0.3 * power_w, 1)  # trög uppdatering
+        else:
+            curve[drive] = round(power_w, 1)
+        save_config(cfg)
+
+    def _reg_mode(self):
+        """Returnerar aktuellt mode (CW/DIGU) eller None."""
+        trx = latest["tx_trx"]
+        m = latest["modulation"].get(trx)
+        return m if m in ("CW", "DIGU") else None
+
+    def _reg_update_label(self):
+        mode = self._reg_mode()
+        tp   = cfg["target_power"].get(mode, 300) if mode else "---"
+        lbl  = f"{tp}W" if isinstance(tp, int) else tp
+        self._reg_lbl.config(text=lbl)
+        col = GREEN if (self._reg_active and mode) else MUTED
+        self._reg_btn.config(fg=col)
+
+    def _reg_apply_ff(self):
+        """Skicka FF-drive direkt via TCI om kurvan har ett lärt värde för nuvarande band/target."""
+        if not self._current_band:
+            return
+        mode = self._reg_mode()
+        if not mode:
+            return
+        target = cfg["target_power"].get(mode)
+        if not target:
+            return
+        ff_drive = self._curve_interpolate(self._current_band, target)
+        if ff_drive is None:
+            return
+        trx = latest["tx_trx"]
+        in_tune = latest["tune_active"].get(trx, False)
+        if in_tune:
+            current = latest["tune_drive"].get(trx, 100)
+            if ff_drive != current:
+                latest["tune_drive"][trx] = ff_drive
+                send_tci_cmd(f"tune_drive:{trx},{ff_drive};")
+        else:
+            current = latest["drive"].get(trx, 100)
+            if ff_drive != current:
+                latest["drive"][trx] = ff_drive
+                send_tci_cmd(f"drive:{trx},{ff_drive};")
+        self._reg_ff_applied = False   # nollställ så regleringen börjar om vid nästa TX
+
+    def _reg_increase(self):
+        mode = self._reg_mode()
+        if not mode:
+            return
+        tp   = cfg["target_power"][mode]
+        step = 10 if tp < 100 else 100
+        cfg["target_power"][mode] = min(tp + step, 1500)
+        save_config(cfg)
+        self._reg_update_label()
+        self._reg_apply_ff()
+
+    def _reg_decrease(self):
+        mode = self._reg_mode()
+        if not mode:
+            return
+        tp   = cfg["target_power"][mode]
+        step = 10 if tp <= 100 else 100
+        cfg["target_power"][mode] = max(tp - step, 10)
+        save_config(cfg)
+        self._reg_update_label()
+        self._reg_apply_ff()
+
+    def _reg_toggle(self):
+        self._reg_active = not self._reg_active
+        self._reg_update_label()
+        state = "ON" if self._reg_active else "OFF"
+        self._log(f"Effektreglering {state}")
+
+    def _regulation_step(self, measured_w):
+        """Justera drive/tune_drive en tick om reglering är aktiv och villkor uppfyllda."""
+        trx   = latest["tx_trx"]
+        mode  = latest["modulation"].get(trx)
+        tx_on = self._tx_on
+
+        if mode not in ("CW", "DIGU") or not self._reg_active or not self._op_on:
+            return
+
+        if not tx_on:
+            self._power_history.clear()
+            self._power_history_slow.clear()
+            self._reg_ff_applied    = False
+            self._reg_stable_since  = None
+            self._reg_phase2        = False
+            self._consec_transients = 0
+            return
+
+        if self._current_band is None:
+            return
+
+        target = cfg["target_power"].get(mode, 300)
+        band   = self._current_band
+        now    = time.monotonic()
+        ts     = time.strftime("%H:%M:%S")
+        rx_tag = f"RX{trx+1}"
+
+        in_tune = latest["tune_active"].get(trx, False)
+        if in_tune:
+            current_drive = latest["tune_drive"].get(trx, 100)
+            cmd_prefix    = f"tune_drive:{trx}"
+        else:
+            current_drive = latest["drive"].get(trx, 100)
+            cmd_prefix    = f"drive:{trx}"
+
+        def set_drive(new_drive):
+            if in_tune: latest["tune_drive"][trx] = new_drive
+            else:       latest["drive"][trx]      = new_drive
+            send_tci_cmd(f"{cmd_prefix},{new_drive};")
+            self._reg_last_adjust = now
+            self._power_history.clear()
+            self._power_history_slow.clear()
+
+        # Nollställ om börvärdet ändrats under sändning
+        if target != self._reg_last_target:
+            self._reg_last_target   = target
+            self._reg_ff_applied    = False
+            self._reg_phase2        = False
+            self._reg_stable_since  = None
+            self._consec_transients = 0
+            self._power_history.clear()
+            self._power_history_slow.clear()
+
+        # ── Feed-forward: hoppa till lärt drive-värde vid TX-start ──
+        if not self._reg_ff_applied:
+            self._reg_ff_applied = True
+            ff_drive = self._curve_interpolate(band, target)
+            if ff_drive is not None and ff_drive != current_drive:
+                set_drive(ff_drive)
+                _reg_logger.info(f"{ts},FF,{band},{mode},{target},{measured_w:.0f},,{current_drive},{ff_drive},feed-forward {rx_tag}")
+            return  # vänta en cykel på att drive ska sätta sig
+
+        # ── Klassificera mätpunkten ──────────────────────────────
+        # min_w: dynamisk undregräns — filtrerar CW-element-glapp och kantprover.
+        # target - 100W ger tillräcklig marginal utan att filtrera bort legitima mätvärden.
+        min_w        = max(50, target - 100)
+        is_transient = measured_w > target + 100
+        is_valid     = min_w <= measured_w <= target + 100
+
+        # Räkna på varandra följande transienter (utan giltigt värde emellan)
+        if is_transient:
+            self._consec_transients = getattr(self, "_consec_transients", 0) + 1
+        else:
+            self._consec_transients = 0
+
+        # ── Överskyddsskydd: transient när TX är etablerad → minska direkt ──
+        history_len = len(self._power_history) + len(self._power_history_slow)
+        if is_transient and (history_len >= 3 or self._consec_transients >= 3):
+            self._reg_phase2       = False
+            self._reg_stable_since = None
+            if now - self._reg_last_adjust >= 0.15:
+                err  = measured_w - target
+                step = 4 if err > 80 else 3 if err > 40 else 2
+                new_drive = max(current_drive - step, 0)
+                set_drive(new_drive)
+                _reg_logger.info(f"{ts},SKYDD,{band},{mode},{target},{measured_w:.0f},,{current_drive},{new_drive},step={step} {rx_tag}")
+            return
+
+        if is_transient:
+            # TX-start-transient — TX ännu inte stabiliserat, ignorera
+            _reg_logger.info(f"{ts},TRANSIENT,{band},{mode},{target},{measured_w:.0f},,{current_drive},,TX-start")
+            return
+
+        # ── Fas 2: underhåll med lång mätning (~10s) ────────────
+        if self._reg_phase2:
+            if is_valid:
+                self._power_history_slow.append(measured_w)
+            n = len(self._power_history_slow)
+            if n < 50:
+                _reg_logger.info(f"{ts},FAS2,{band},{mode},{target},{measured_w:.0f},,{current_drive},,n={n}/50")
+                return
+            avg   = sum(self._power_history_slow) / n
+            error = avg - target
+            self._power_history_slow.clear()
+            if abs(error) < 10:
+                _reg_logger.info(f"{ts},FAS2-OK,{band},{mode},{target},{measured_w:.0f},{avg:.0f},{current_drive},,stabil")
+                return
+            # Drift utanför tolerans → 1-stegs korrigering, tillbaka till fas 1
+            self._curve_add_point(band, current_drive, avg)
+            self._reg_phase2       = False
+            self._reg_stable_since = None
+            step      = 1
+            new_drive = max(current_drive - step, 0) if error > 0 else min(current_drive + step, 100)
+            set_drive(new_drive)
+            _reg_logger.info(f"{ts},FAS2-drift,{band},{mode},{target},{measured_w:.0f},{avg:.0f},{current_drive},{new_drive},→fas1")
+            return
+
+        # ── Fas 1: aktiv sökning med rullande medelvärde (~2s) ──
+        if is_valid:
+            self._power_history.append(measured_w)
+        n = len(self._power_history)
+        if n < 4:
+            _reg_logger.info(f"{ts},FAS1,{band},{mode},{target},{measured_w:.0f},,{current_drive},,n={n}/4")
+            return
+
+        avg     = sum(self._power_history) / n
+        error   = avg - target
+        abs_err = abs(error)
+
+        if abs_err < 10:
+            if self._reg_stable_since is None:
+                self._reg_stable_since = now
+            if now - self._reg_stable_since >= 2.0:
+                # Stabil i 2s → spara kurv-punkt och gå till fas 2
+                self._curve_add_point(band, current_drive, avg)
+                self._reg_phase2       = True
+                self._reg_stable_since = None
+                self._power_history_slow.clear()
+                _reg_logger.info(f"{ts},FAS1→FAS2,{band},{mode},{target},{measured_w:.0f},{avg:.0f},{current_drive},,stabil 2s {rx_tag}")
+            else:
+                _reg_logger.info(f"{ts},FAS1-stabil,{band},{mode},{target},{measured_w:.0f},{avg:.0f},{current_drive},,inom 10W")
+            return
+
+        # Utanför tolerans → proportionell justering
+        self._reg_stable_since = None
+        if abs_err > 80:   step, interval = 4, 0.15
+        elif abs_err > 40: step, interval = 3, 0.20
+        elif abs_err > 20: step, interval = 2, 0.30
+        else:              step, interval = 1, 0.50
+        if now - self._reg_last_adjust < interval:
+            _reg_logger.info(f"{ts},FAS1-väntar,{band},{mode},{target},{measured_w:.0f},{avg:.0f},{current_drive},,cooldown")
+            return
+        new_drive = max(current_drive - step, 0) if error > 0 else min(current_drive + step, 100)
+        set_drive(new_drive)
+        _reg_logger.info(f"{ts},FAS1-just,{band},{mode},{target},{measured_w:.0f},{avg:.0f},{current_drive},{new_drive},step={step} {rx_tag}")
 
     def _apply_op_state(self, op):
         if op != self._swr_in_op:
@@ -1095,6 +1499,11 @@ class TunerGUI:
                     display = f"{rx_label}  {data/1_000_000:.6f} MHz" if data else ""
                     self.freq_lbl.config(text=display)
 
+                elif event == "modulation":
+                    trx, mode = data
+                    if trx == latest["tx_trx"]:
+                        self._reg_update_label()
+
                 elif event == "tci_status":
                     ok = data == "connected"
                     self.tci_lbl.config(text=f"TCI: {'OK' if ok else 'LOST'}",
@@ -1114,8 +1523,12 @@ class TunerGUI:
                 elif event == "telemetry":
                     p = data.get("power")
                     if p is not None:
-                        self.power_meter.set(p, f"{p:.1f} W")
+                        self._power_display.append(p)
+                        p_avg = sum(self._power_display) / len(self._power_display)
+                        self.power_meter.set(p_avg, f"{p_avg:.0f} W")
+                        self._regulation_step(p)
                     else:
+                        self._power_display.clear()
                         self.power_meter.clear()
 
                     # TX — 400 ms debounce mot falskt TX-flimmer
@@ -1142,6 +1555,7 @@ class TunerGUI:
                         if self._band_pending is None or self._band_pending[0] != b:
                             self._band_pending = (b, time.monotonic())
                         elif time.monotonic() - self._band_pending[1] >= 0.50:
+                            self._current_band = b
                             self.band_lbl.config(text=f"Band: {b}", fg=TEXT)
 
                     if "temp" in data and data["temp"] is not None:

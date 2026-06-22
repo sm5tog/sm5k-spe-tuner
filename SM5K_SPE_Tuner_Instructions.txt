@@ -1,5 +1,5 @@
 ================================================================
-SM5K SPE Tuner v1.0.0  –  User Instructions
+SM5K SPE Tuner v1.1.0  –  User Instructions
 ================================================================
 Controller software for SPE Expert 1K-FA linear amplifier
 and SunSDR transceiver (or other TCI-compatible radio)
@@ -183,6 +183,69 @@ banner appears below the meters showing the fault type:
 HALF / FULL: Note that the amplifier automatically switches
 from FULL to HALF power if temperature rises significantly,
 before the SERIOUS alarm level is reached.
+
+
+POWER REGULATION (NEW in v1.1.0)
+----------------------------------------------------------------
+The program can automatically regulate output power to a set
+target level during CW and digital mode (DIGU/FT8) operation.
+
+ENABLING REGULATION
+  Click the REG button to toggle regulation on/off.
+  When active, the button is highlighted.
+  Regulation only runs during CW and DIGU modes — it is
+  inactive during SSB, FM and other modes.
+
+TARGET POWER
+  Use the + and − buttons next to the REG button to set the
+  desired output power (W). Separate targets are stored for
+  CW and DIGU. Adjustment step is 10W.
+
+  The target is saved per mode and applies on all bands.
+
+HOW IT WORKS
+  The regulator uses two phases:
+
+  Phase 1 — Active search (first ~2 seconds of transmission):
+    Collects 4 power readings and calculates the average.
+    Adjusts drive up or down based on error from target.
+    Large errors → fast, coarse steps.
+    Small errors → slow, fine steps.
+    When stable within ±10W for 2 seconds → moves to Phase 2.
+
+  Phase 2 — Slow maintenance:
+    Collects 50 readings (~25 seconds).
+    Only adjusts if drift exceeds ±10W from target.
+    Minimal impact on signal during normal operation.
+
+  Feed-forward:
+    The program remembers which drive level produced the target
+    power on each band. At each new TX-start, it jumps directly
+    to the learned level — reducing the time needed to stabilise.
+
+OVERPOWER PROTECTION
+  If measured power exceeds the target by more than 100W,
+  the program immediately reduces drive. This protection is
+  independent of the normal regulation cycle.
+
+NOTES
+  - The regulator measures forward power from the amplifier's
+    RS-232 telemetry — this is the amplifier output power, not
+    the exciter power. Set the target relative to the amplifier
+    output (e.g. 300W, 500W, 800W).
+  - CW inter-element gaps (key-up between dots and dashes) are
+    automatically filtered out and do not affect the average.
+  - Regulation is paused when the amplifier is in STANDBY.
+  - For contest use or extended sessions, let the regulator run
+    for a few transmissions on each band before expecting
+    accurate results. The feed-forward improves with use.
+  - A detailed log file (reg_log.csv) is written alongside the
+    EXE for diagnostic purposes.
+
+SEPARATE HIGH/LOW SETTINGS
+  The + and − buttons adjust the target for the current mode
+  (CW or DIGU). If you switch between HIGH and LOW power on
+  the amplifier, remember to adjust the target accordingly.
 
 
 TWO RADIO OPERATION

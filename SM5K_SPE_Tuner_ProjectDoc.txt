@@ -166,22 +166,84 @@ the sync header; incomplete or misaligned data is discarded.
 TCI = Transceiver Control Interface, WebSocket-based.
 Default: ws://127.0.0.1:50001
 
-Commands used:
-  "vfo:0,0;"           – request current VFO A frequency
-  "vfo:0,0,{freq};"   – set VFO A to {freq} Hz
-  "tune:0,true;"      – start CW carrier (TX on)
-  "tune:0,false;"     – stop carrier (TX off)
-  "modulation:0,CW;"  – ensure CW mode before tuning
+Commands sent at connect:
+  "vfo:0,0;" / "vfo:1,0;"          – request VFO A freq per TRX
+  "modulation:0;" / "modulation:1;" – request current mode
+  "drive:0;" / "drive:1;"           – request current drive level
+  "tune_drive:0;" / "tune_drive:1;" – request tune drive level
+  "tx_sensors_enable:true,100;"     – enable TX sensor notifications
 
-Frequency arrives as: "vfo:0,0,14225000;"
+Commands sent during operation:
+  "vfo:N,0,{freq};"     – set VFO A frequency on TRX N
+  "tune:N,true/false;"  – start/stop tune carrier on TRX N
+  "modulation:N,CW;"    – set CW mode on TRX N
+  "drive:N,{val};"      – set drive 0-100 on TRX N
+  "tune_drive:N,{val};" – set tune drive 0-100 on TRX N
+
+Key notifications received from ExpertSDR:
+  "vfo:N,0,{freq};"                 – VFO frequency update
+  "modulation:N,{mode};"            – mode change
+  "drive:N,{val};"                  – drive level (ExpertSDR echo)
+  "tune_drive:N,{val};"             – tune drive (ExpertSDR echo)
+  "trx:N,true/false;"               – TX state (unreliable, see 4b)
+  "tune:N,true/false;"              – tune state (reliable)
+  "tx_frequency:{freq};"            – exact TX frequency
+  "tx_sensors:N,mic,rms,peak,swr;" – TX power readings per TRX
 
 Connection management:
-  - settimeout(30) so recv() blocks up to 30 seconds
-  - On timeout, send vfo:0,0; poll to keep connection alive
-    (catches both WebSocketTimeoutException and socket.timeout)
+  - ws.settimeout(0.15) for fast polling loop
+  - Keepalive: send vfo:0,0; vfo:1,0; every ~30s
   - On radio switch (active_radio changes), inner loop breaks
     and reconnects to the new radio's TCI URL
   - Reconnect delay: 3 seconds
+
+
+4b. DUAL-RX TX-TRX DETECTION — LESSONS LEARNED
+----------------------------------------------------------------
+Determining which TRX is active for TX is the most complex part
+of TCI integration. The correct solution uses THREE sources because
+ExpertSDR behaves differently depending on TX method:
+
+SOURCE 1: tune:N,true
+  When: tune button pressed (both RX1 and RX2)
+  Action: tx_trx = N
+  Why: ExpertSDR sends this immediately and reliably for all tune
+  operations, regardless of which radio is active.
+
+SOURCE 2: tx_sensors:N,...,power_peak,...
+  When: any actual RF transmission (keyer, macro, DIGU, voice)
+  Action: if power_peak > 1.0W → tx_trx = N
+  Why: The only reliable signal for hardware keyer CW on RX2.
+  ExpertSDR sends TX_SENSORS per TRX with measured output power.
+  Must be enabled via tx_sensors_enable:true,100; at connect.
+  Note: power=0 during CW inter-element gaps — tx_trx is NOT reset
+  on zero power, only updated when power > threshold.
+
+SOURCE 3: trx:N,true
+  When: macro CW, DIGU (FT8 etc.)
+  Action: tx_trx = N
+  Why: ExpertSDR sends trx:N,true for software-initiated TX.
+  trx:N,false is intentionally IGNORED for tx_trx (only updates
+  trx_active dict). False events must never reset tx_trx.
+
+WHAT DOES NOT WORK — do not attempt these:
+  tx_enable:N,true/false
+    ExpertSDR sends this for internal routing; TRX number does not
+    reliably match the radio actually transmitting.
+
+  "Lowest active wins" on trx_active
+    ExpertSDR often sends trx:0,true for ALL transmissions regardless
+    of which radio is active. This always snaps tx_trx to 0.
+
+  RS232 active_input (byte [18] bits 3-0)
+    Reports which amp INPUT has RF signal. The amp switches input
+    based on RF presence, not on user intent. A QRM burst on IN1
+    could incorrectly flip tx_trx while operating on RX2.
+    RS232 should only be used for amp state (power, SWR, temp etc).
+
+MANUAL OVERRIDE:
+  Clicking the RX1/RX2 frequency label calls _toggle_rx() which
+  flips tx_trx immediately. Available as fallback for edge cases.
 
 
 5. TWO-RADIO ARCHITECTURE
