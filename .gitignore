@@ -3,3 +3,9 @@ __pycache__/
 build/
 dist/
 settings.json
+settings_klient.json
+reg_log.csv
+reg_log_klient.csv
+ampd_config.json
+refs/
+CLAUDE.md

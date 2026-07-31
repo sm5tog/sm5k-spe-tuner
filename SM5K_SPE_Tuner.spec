@@ -1,12 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+# customtkinter laddar sina temafiler (.json) i runtime — de måste bundlas,
+# annars kraschar den frysta byggen med "theme not found". ee_theme.py är en
+# lokal modul och plockas upp automatiskt.
+_ctk_datas   = collect_data_files('customtkinter')
+_ctk_hidden  = collect_submodules('customtkinter')
 
 a = Analysis(
     ['spe_tuner.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=_ctk_datas,
+    hiddenimports=_ctk_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

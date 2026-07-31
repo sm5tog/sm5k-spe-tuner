@@ -370,3 +370,27 @@ python -m PyInstaller SM5K_SPE_Tuner.spec
 - v1.0.3: Lika stora tune-knappar, fast fönsterstorlek, frekvensåterställning efter sweep, dual-RX frekvensvisning med RX-prefix
 - v1.0.4: Dual-RX TX-tracking via `trx:N,true/false`, `trx_active`-dict, AMP ON/OFF återinförd korrekt, OP-debounce återinförd, HIGH/LOW power-fix
 - v1.0.5: Effektreglering (CW/DIGU), feed-forward kurva, FAS1/FAS2, TX-TRX-detektering via `tx_sensors` + `tune:N,true`
+- v1.1.0 (spe_tuner_klient.py, ny separat variant): klient/daemon-split för fjärrstyrning, se avsnitt nedan
+
+---
+
+## Klient/daemon-arkitektur (spe_tuner_klient.py + spe_ampd.py), 2026-07-31
+
+**Bakgrund:** slutsteget kan stå i Ramnäs eller Blecket, operatören kan sitta på andra orten. RS232 (DTR/timing-känsligt) och TCI (WebSocket mot ExpertSDR3) måste båda vara lokala för att fungera pålitligt — se historiken i `radioutrustning/kunskapsbank_fjarrstyrning.md`.
+
+**Filer (samma repo, `spe_tuner.py` orört):**
+- `spe_ampd.py` — headless daemon, kör som systemd-tjänst (`spe-ampd.service`) på en Raspberry Pi fysiskt vid slutsteget. Äger `serial.Serial`, DTR/AMP on-off, init-paket, 35-byte telemetriparsning. Egen `ampd_config.json` (serieport, lyssn-host/port, `heartbeat_timeout`).
+- `spe_tuner_klient.py` — identiskt GUI med `spe_tuner.py`, men `serial`-importen och all direkt portåtkomst ersatt av en beständig TCP/JSON-anslutning (`ampd_listener_loop`, mirrorspegel av den befintliga `tci_listener_loop`). Egna config-/loggfiler (`settings_klient.json`, `reg_log_klient.csv`).
+
+**Protokoll (JSON-rader över TCP, en rad = ett meddelande):**
+- Klient → daemon: `{"cmd":"amp_on"}`, `{"cmd":"amp_off"}`, `{"cmd":"key","code":N}` (samma keycodes som RS232-protokollet ovan), `{"cmd":"heartbeat"}` (var 1:a s).
+- Daemon → klient (broadcast till alla anslutna): `{"type":"telemetry", ...samma fältnamn som callback("telemetry", ...) redan använde...}`, `{"type":"serial_status","value":"connected"/"disconnected"}`, `{"type":"amp_status","value":"on"/"off"}`, `{"type":"log","msg":"..."}`.
+- `latest["ser"]` (boolean-check i `manual_tune`/`run_tune`) ersatt av `latest["amp_on"]`, satt från `amp_status`-meddelanden.
+
+**Failsafe (kritiskt):** daemonen stänger serieporten (DTR låg, AMP OFF) omedelbart om sista klienten kopplar från, eller om `heartbeat_timeout` (default 5 s) löper ut utan livstecken. Ett obemannat 1 kW-slutsteg lämnas alltså aldrig i ON/OPERATE om styrlänken dör. Flera klienter kan vara anslutna samtidigt (ingen arbitrering mellan dem — se TODO.md).
+
+**Känd race, fixad:** att stänga serieporten (`amp_off`) från en annan tråd medan `_telemetry_loop` gör en blockerande `ser.read()` kunde krascha läs-tråden (pyserial kastar en malplacerad `TypeError` när fd:t stängs mitt i). Löst genom att fånga alla exceptions runt `read_packet()`-anropet och tolka det som normal avstängning.
+
+**Driftsättning (nuvarande instans):** `ramnas-station` (`192.168.68.107:5560`), eftersom slutsteget står i Ramnäs. USB-dongel: Prolific "ATEN USB to Serial Bridge" (`067b:23a3`), `pl2303`-drivrutinen inbyggd i Raspberry Pi OS Trixie, ingen extra installation.
+
+**GUI på fjärrmaskin — TCI-fallgrop:** `Settings → Radio N → TCI Host` får INTE stå kvar på `127.0.0.1` om GUI:t körs på en annan dator än den som kör ExpertSDR3 — det är bara loopback lokalt. Måste sättas till den datorns riktiga LAN-IP (t.ex. tomahawks `192.168.68.103`), samma port som vanligt.
