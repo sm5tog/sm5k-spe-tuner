@@ -1,10 +1,12 @@
 ## ==========================================================
-## SM5K SPE Tuner v1.1.0
+## SM5K SPE Tuner v1.2.0
 ## SPE Expert 1K-FA controller – Single file | In-app settings
 ## Author: SM5K (SM5TOG)
 ## ==========================================================
 
 import tkinter as tk
+import customtkinter as ctk
+import ee_theme as th
 import threading
 import queue
 import time
@@ -13,8 +15,18 @@ from collections import deque
 import json
 import os
 import socket
+import subprocess
+import sys
+import webbrowser
 import websocket
 import serial
+
+__version__      = "1.2.0"
+RELEASE_REPO     = "sm5tog/sm5k-spe-tuner"
+UPDATE_CHECK_URL = f"https://api.github.com/repos/{RELEASE_REPO}/releases/latest"
+UPDATE_CHECK_MS  = 60 * 60 * 1000   # en gång i timmen, samma som jtspots
+UPDATER_NAME     = "SM5K_SPE_TunerUpdater.exe"
+DONATE_URL       = "https://www.paypal.com/donate/?hosted_button_id=5VX8NE7LQEGF4"
 
 # ──────────────────────────────────────────────────────────
 # CONFIG
@@ -24,6 +36,7 @@ DEFAULT_RADIO = {"name": "", "input": 1, "tci_host": "127.0.0.1", "tci_port": 50
 
 DEFAULT_CONFIG = {
     "serial_port": "COM6",
+    "ui_mode": "classic",   # "classic" (original look) or "compact" (rounded ee_theme look)
     "target_power": {"CW": 300, "DIGU": 300},
     "drive_curve":  {},   # {band: {drive: power}} — gemensam för alla modes
     "radios": [
@@ -63,9 +76,10 @@ import sys as _sys
 # Med PyInstaller --onefile pekar __file__ på en temporär mapp som
 # försvinner vid stängning – sys.executable pekar på EXE:n istället.
 if getattr(_sys, "frozen", False):
-    _cfg_path = os.path.join(os.path.dirname(_sys.executable), "settings.json")
+    APP_DIR   = os.path.dirname(_sys.executable)
 else:
-    _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+    APP_DIR   = os.path.dirname(os.path.abspath(__file__))
+_cfg_path = os.path.join(APP_DIR, "settings.json")
 
 def load_config():
     try:
@@ -74,6 +88,8 @@ def load_config():
             result = dict(DEFAULT_CONFIG)
             if "serial_port" in saved:
                 result["serial_port"] = saved["serial_port"]
+            if saved.get("ui_mode") in ("classic", "compact"):
+                result["ui_mode"] = saved["ui_mode"]
             if "radios" in saved:
                 result["radios"] = saved["radios"]
             if "target_power" in saved:
@@ -121,20 +137,51 @@ def find_radio(input_nr):
 # PALETTE
 # ──────────────────────────────────────────────────────────
 
-BG      = "#16181d"
-PANEL   = "#1e2028"
-BORDER  = "#2a2d3a"
-TEXT    = "#d4d8e8"
-MUTED   = "#555a6e"
-GREEN   = "#48c774"
-RED     = "#e05252"
-AMBER   = "#e8a030"
-BTNBG   = "#2a2d3a"
-BTNFG   = "#d4d8e8"
-TUNEBG  = "#1a3d1a"
-TUNEFG  = "#48c774"
-STOPBG  = "#3d1a1a"
-STOPFG  = "#e05252"
+COMPACT_UI = (cfg.get("ui_mode", "classic") == "compact")
+
+if COMPACT_UI:
+    # Samma profil som spe_tuner_klient.py / SunSync — bara ett skin,
+    # ingen logik ändras. Modulnamnen nedan hålls identiska mellan
+    # lägena så resten av filen (som redan bara refererar dessa namn)
+    # inte behöver bry sig om vilket läge som är aktivt.
+    th.setup()
+    BG      = th.color("bg_app")
+    PANEL   = th.color("bg_surface")
+    CTRL    = th.color("bg_control")
+    BORDER  = th.color("border")
+    TEXT    = th.color("text_primary")
+    MUTED   = th.color("text_secondary")
+    GREEN   = th.color("accent_green")
+    RED     = th.color("accent_red")
+    AMBER   = th.color("accent_orange")
+    WHITE   = th.color("btn_text_on_accent")
+    BTNBG   = th.color("btn_idle_bg")
+    BTNFG   = th.color("btn_text")
+    TUNEBG  = th.color("accent_green")
+    TUNEFG  = th.color("btn_text_on_accent")
+    STOPBG  = th.color("accent_red")
+    STOPFG  = th.color("btn_text_on_accent")
+    RADIUS  = th.METRICS["radius"]
+else:
+    BG      = "#16181d"
+    PANEL   = "#1e2028"
+    CTRL    = "#2a2d3a"
+    BORDER  = "#2a2d3a"
+    TEXT    = "#d4d8e8"
+    MUTED   = "#555a6e"
+    GREEN   = "#48c774"
+    RED     = "#e05252"
+    AMBER   = "#e8a030"
+    WHITE   = "#ffffff"
+    BTNBG   = "#2a2d3a"
+    BTNFG   = "#d4d8e8"
+    TUNEBG  = "#1a3d1a"
+    TUNEFG  = "#48c774"
+    STOPBG  = "#3d1a1a"
+    STOPFG  = "#e05252"
+    RADIUS  = 0
+
+TXINT = "#2a1818"   # subtil röd bakgrund vid TX-highlight, samma i båda lägena
 
 # ──────────────────────────────────────────────────────────
 # CORE – STATE
@@ -680,12 +727,13 @@ def run_tune(band, callback):
 # ──────────────────────────────────────────────────────────
 
 class Meter(tk.Frame):
+    """Classic (original raw-tkinter) look."""
     BAR_W = 170
     BAR_H = 8
 
-    def __init__(self, parent, label, unit, max_val, thresholds):
+    def __init__(self, parent, label, unit, max_val, thresholds, fonts=None):
         super().__init__(parent, bg=PANEL, padx=16, pady=12)
-        self._max = max_val; self._thresholds = thresholds
+        self._max = max_val; self._thresholds = thresholds; self._unit = unit
         self._hdr = tk.Label(self, text=label, bg=PANEL, fg=MUTED, font=("Consolas", 8))
         self._hdr.pack(anchor="w")
         self.val_lbl = tk.Label(self, text=f"--- {unit}", bg=PANEL, fg=TEXT,
@@ -710,12 +758,68 @@ class Meter(tk.Frame):
         self.cv.coords(self._bar, 0, 0, 0, self.BAR_H)
 
     def highlight(self, on):
-        bg = "#2a1818" if on else PANEL
+        bg = TXINT if on else PANEL
         self.config(bg=bg)
         for w in self.winfo_children():
             try: w.config(bg=bg)
             except tk.TclError: pass
         self.val_lbl.config(fg="white" if on else TEXT)
+
+    def reconfigure(self, label, max_val, thresholds):
+        self._hdr.config(text=label)
+        self._max        = max_val
+        self._thresholds = thresholds
+
+
+class CompactMeter(ctk.CTkFrame):
+    """Compact (ee_theme / ExpertSDR3-look) look, ported from spe_tuner_klient.py."""
+    BAR_W = 64
+
+    def __init__(self, parent, label, unit, max_val, thresholds, fonts):
+        super().__init__(parent, fg_color=PANEL, corner_radius=RADIUS,
+                         border_width=1, border_color=BORDER)
+        self._max = max_val; self._thresholds = thresholds; self._unit = unit
+        self._hdr = ctk.CTkLabel(self, text=label, text_color=MUTED,
+                                 font=fonts["small"])
+        self._hdr.pack(anchor="w", padx=12, pady=(6, 0))
+        self.val_lbl = ctk.CTkLabel(self, text=f"--- {unit}", text_color=TEXT,
+                                    font=fonts["val"], anchor="w")
+        self.val_lbl.pack(anchor="w", padx=12)
+        self.bar = ctk.CTkProgressBar(self, width=self.BAR_W, height=6,
+                                      corner_radius=RADIUS, progress_color=GREEN,
+                                      fg_color=CTRL)
+        self.bar.set(0)
+        self.bar.pack(anchor="w", padx=12, pady=(4, 10))
+
+    def set(self, value, text):
+        pct = min(max(value/self._max, 0.0), 1.0)
+        col = GREEN
+        for thresh, c in self._thresholds:
+            if value >= thresh: col = c
+        self.val_lbl.configure(text=text, text_color=col)
+        self.bar.configure(progress_color=col)
+        self.bar.set(pct)
+
+    def clear(self):
+        self.val_lbl.configure(text="---", text_color=TEXT)
+        self.bar.set(0)
+
+    def highlight(self, on):
+        self.configure(fg_color=TXINT if on else PANEL,
+                       border_color=RED if on else BORDER)
+        self.val_lbl.configure(text_color=WHITE if on else TEXT)
+
+    def reconfigure(self, label, max_val, thresholds):
+        self._hdr.configure(text=label)
+        self._max        = max_val
+        self._thresholds = thresholds
+
+
+def make_meter(parent, label, unit, max_val, thresholds, fonts=None):
+    """Factory that returns the right Meter variant for the active ui_mode."""
+    if COMPACT_UI:
+        return CompactMeter(parent, label, unit, max_val, thresholds, fonts)
+    return Meter(parent, label, unit, max_val, thresholds)
 
 # ──────────────────────────────────────────────────────────
 # WIDGET – COLLAPSIBLE SECTION
@@ -762,6 +866,22 @@ class SettingsDialog(tk.Toplevel):
 
         self._vars   = {}
         self._rvars  = [[], []]   # radio vars per index
+        self._ui_mode = cfg.get("ui_mode", "classic")
+
+        # ── Fönsterstil ──────────────────────────────────────
+        self._section_label("WINDOW STYLE")
+        mode_row = tk.Frame(self, bg=BG, padx=18, pady=4)
+        mode_row.pack(fill="x")
+        self._mode_buttons = {}
+        for mode, label in (("classic", "Classic"), ("compact", "Compact")):
+            b = tk.Button(mode_row, text=label, font=("Consolas", 9, "bold"),
+                          relief="flat", bd=0, padx=8, pady=6, cursor="hand2",
+                          command=lambda m=mode: self._select_mode(m))
+            b.pack(side="left", expand=True, fill="x", padx=(0, 6) if mode == "classic" else 0)
+            self._mode_buttons[mode] = b
+        self._select_mode(self._ui_mode)
+        tk.Label(self, text="Requires restarting the app to take effect.",
+                 bg=BG, fg=MUTED, font=("Consolas", 8)).pack(pady=(2, 0))
 
         # ── SPE Expert – COM-port ────────────────────────────
         self._section_label("SPE EXPERT AMPLIFIER")
@@ -813,12 +933,29 @@ class SettingsDialog(tk.Toplevel):
         tk.Button(btn_row, text="Cancel", command=self.destroy, **bkw).pack(side="right", padx=(6,0))
         tk.Button(btn_row, text="Save",   command=self._save,   **bkw).pack(side="right")
 
+        donate = tk.Label(self, text="♥ Support this project (PayPal)",
+                          bg=BG, fg=MUTED, font=("Consolas", 9, "underline"),
+                          cursor="hand2")
+        donate.pack(pady=(0, 14))
+        donate.bind("<Button-1>", lambda e: webbrowser.open(DONATE_URL))
+        donate.bind("<Enter>", lambda e: donate.config(fg=AMBER))
+        donate.bind("<Leave>", lambda e: donate.config(fg=MUTED))
+
+    def _select_mode(self, mode):
+        self._ui_mode = mode
+        for m, b in self._mode_buttons.items():
+            selected = (m == mode)
+            b.config(bg=AMBER if selected else BTNBG,
+                     fg=BG if selected else TEXT,
+                     activebackground=AMBER if selected else BORDER)
+
     def _section_label(self, text):
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", pady=(8, 0))
         tk.Label(self, text=text, bg=BG, fg=MUTED,
                  font=("Consolas", 8, "bold")).pack(anchor="w", padx=18, pady=(4, 0))
 
     def _save(self):
+        cfg["ui_mode"] = self._ui_mode
         # COM-port
         try:
             cfg["serial_port"] = self._vars["serial_port"][0].get().strip()
@@ -890,7 +1027,7 @@ class TunerGUI:
         self._amp_connected  = False
         self._serial_running = None
 
-        root.title("SM5K SPE Tuner v1.1.0")
+        root.title(f"SM5K SPE Tuner v{__version__}")
         root.configure(bg=BG)
         root.resizable(False, False)
 
@@ -911,12 +1048,15 @@ class TunerGUI:
         self._power_history_slow   = deque(maxlen=50)   # fas 2: ~10s
         self._power_display        = deque(maxlen=3)    # utjämning för display
 
+        self._update_available_tag = None
+
         self._tci_running = start_tci(self.callback)
         self._build_ui()
         self._set_controls("disabled")
         root.update_idletasks()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self.process_queue)
+        self.root.after(2000, self._update_check_tick)
 
     # ── Layout ──────────────────────────────────────────────
 
@@ -940,18 +1080,28 @@ class TunerGUI:
                              relief="flat", font=("Consolas", 12),
                              cursor="hand2", bd=0,
                              command=lambda: SettingsDialog(self.root))
+        self._btn_update = tk.Button(bar, text="", bg=BORDER, fg=AMBER,
+                             activebackground=BORDER, activeforeground=AMBER,
+                             relief="flat", font=("Consolas", 9, "bold"),
+                             cursor="hand2", bd=0,
+                             command=self._launch_updater)
         self.tci_lbl.pack(side="left", padx=8, pady=3)
         self.serial_lbl.pack(side="left", padx=4, pady=3)
         self.amp_btn.pack(side="left", padx=4, pady=3)
         cfg_btn.pack(side="right", padx=8, pady=2)
+        # _btn_update packas bara in när en nyare version faktiskt hittats,
+        # se _show_update_available.
         self.radio_lbl.pack(side="right", padx=4, pady=3, fill="x", expand=True)
 
         # Mätare
         self._meters_frame = tk.Frame(r, bg=PANEL)
         self._meters_frame.pack(fill="x")
 
-        self.power_meter = Meter(self._meters_frame, "POWER", "W",  150, [(60, AMBER),(100, RED)])
-        self.swr_meter   = Meter(self._meters_frame, "SWR",   "",   3.0, [(1.5, AMBER),(2.5, RED)])
+        meter_fonts = None
+        if COMPACT_UI:
+            meter_fonts = {"small": th.font("small"), "val": th.font("body", bold=True, scale=2.4)}
+        self.power_meter = make_meter(self._meters_frame, "POWER", "W",  150, [(60, AMBER),(100, RED)], meter_fonts)
+        self.swr_meter   = make_meter(self._meters_frame, "SWR",   "",   3.0, [(1.5, AMBER),(2.5, RED)], meter_fonts)
         self.power_meter.pack(side="left", expand=True, fill="both")
         tk.Frame(self._meters_frame, bg=BORDER, width=1).pack(side="left", fill="y", pady=8)
         self.swr_meter.pack(side="left", expand=True, fill="both")
@@ -1333,13 +1483,9 @@ class TunerGUI:
         if op != self._swr_in_op:
             self._swr_in_op = op
             if op:
-                self.swr_meter._hdr.config(text="REF POWER")
-                self.swr_meter._max        = 200
-                self.swr_meter._thresholds = [(60, AMBER), (150, RED)]
+                self.swr_meter.reconfigure("REF POWER", 200, [(60, AMBER), (150, RED)])
             else:
-                self.swr_meter._hdr.config(text="SWR")
-                self.swr_meter._max        = 3.0
-                self.swr_meter._thresholds = [(1.5, AMBER), (2.5, RED)]
+                self.swr_meter.reconfigure("SWR", 3.0, [(1.5, AMBER), (2.5, RED)])
             self.swr_meter.clear()
         self.mode_btn.config(
             text="Mode: OPERATE" if op else "Mode: STANDBY",
@@ -1393,6 +1539,60 @@ class TunerGUI:
             self._amp_disconnect()
         else:
             self._amp_connect()
+
+    # ── Auto-uppdatering ────────────────────────────────────
+    # Samma mönster som jtspots: pollar GitHub-releasetaggen en gång i
+    # timmen, laddar aldrig ner något själv (se SM5K_SPE_TunerUpdater.py
+    # för själva bytet, som körs som en separat process eftersom Windows
+    # inte tillåter att skriva över en körande exe-fil).
+
+    def _update_check_tick(self):
+        threading.Thread(target=self._check_for_update, daemon=True).start()
+        self.root.after(UPDATE_CHECK_MS, self._update_check_tick)
+
+    @staticmethod
+    def _version_tuple(v):
+        v = v.strip().lstrip("vV")
+        parts = []
+        for p in v.split("."):
+            try: parts.append(int(p))
+            except ValueError: break
+        return tuple(parts)
+
+    def _check_for_update(self):
+        try:
+            import urllib.request
+            req = urllib.request.Request(UPDATE_CHECK_URL, headers={"User-Agent": "SM5K-SPE-Tuner"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            tag = data.get("tag_name", "")
+            if self._version_tuple(tag) > self._version_tuple(__version__):
+                self.root.after(0, lambda t=tag: self._show_update_available(t))
+        except Exception:
+            pass
+
+    def _show_update_available(self, tag):
+        if self._update_available_tag == tag:
+            return
+        self._update_available_tag = tag
+        self._btn_update.config(text=f"Uppdatering: {tag}")
+        self._btn_update.pack(side="right", padx=(4, 6))
+        self._log(f'Ny version {tag} tillgänglig — klicka "Uppdatering: {tag}" för att installera')
+
+    def _launch_updater(self):
+        if not getattr(sys, "frozen", False):
+            self._log("Uppdatering är bara tillgänglig i .exe-versionen")
+            return
+        updater = os.path.join(APP_DIR, UPDATER_NAME)
+        if not os.path.exists(updater):
+            self._log(f"Hittade inte {UPDATER_NAME} i programmappen")
+            return
+        try:
+            subprocess.Popen([updater, "--update"], cwd=APP_DIR)
+        except Exception as e:
+            self._log(f"Kunde inte starta uppdateraren: {e}")
+            return
+        self._on_close()
 
     def _on_close(self):
         if self._amp_connected:
