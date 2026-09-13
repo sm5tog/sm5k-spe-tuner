@@ -7,5 +7,6 @@ settings_klient.json
 reg_log.csv
 reg_log_klient.csv
 ampd_config.json
+spe_tuner_winpos.json
 refs/
 CLAUDE.md

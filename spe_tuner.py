@@ -21,7 +21,7 @@ import webbrowser
 import websocket
 import serial
 
-__version__      = "1.2.0"
+__version__      = "1.2.1"
 RELEASE_REPO     = "sm5tog/sm5k-spe-tuner"
 UPDATE_CHECK_URL = f"https://api.github.com/repos/{RELEASE_REPO}/releases/latest"
 UPDATE_CHECK_MS  = 60 * 60 * 1000   # en gång i timmen, samma som jtspots
@@ -646,6 +646,7 @@ def manual_tune(callback):
         callback("done", None)
         return
 
+    orig_mode = latest["modulation"].get(trx)
     ws = websocket.create_connection(_tci_url(), timeout=5)
     try:
         callback("status", f"MANUAL TUNE RX{trx+1}: {freq/1_000_000:.3f} MHz")
@@ -666,6 +667,9 @@ def manual_tune(callback):
     finally:
         try: set_tx(ws, False, trx)
         except: pass
+        if orig_mode and orig_mode != "CW":
+            try: ws.send(f"modulation:{trx},{orig_mode};")
+            except: pass
         ws.close()
 
     stop_requested.clear()
@@ -684,6 +688,7 @@ def run_tune(band, callback):
 
     trx = latest["tx_trx"]
     restore_freq = latest["freq_rx1"] if trx == 1 else latest["freq_rx0"]
+    orig_mode = latest["modulation"].get(trx)
     start_f, end_f = BANDS[band]
     ws = websocket.create_connection(_tci_url(), timeout=5)
     try:
@@ -714,6 +719,9 @@ def run_tune(band, callback):
     finally:
         try: set_tx(ws, False, trx)
         except: pass
+        if orig_mode and orig_mode != "CW":
+            try: ws.send(f"modulation:{trx},{orig_mode};")
+            except: pass
         if restore_freq:
             try: set_freq(ws, restore_freq, trx)
             except: pass

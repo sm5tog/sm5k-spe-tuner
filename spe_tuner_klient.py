@@ -19,6 +19,8 @@ import os
 import socket
 import websocket
 
+import win_snap
+
 # ──────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────
@@ -99,6 +101,25 @@ def load_config():
             return result
     except (FileNotFoundError, json.JSONDecodeError):
         return json.loads(json.dumps(DEFAULT_CONFIG))
+
+if getattr(_sys, "frozen", False):
+    _winpos_path = os.path.join(os.path.dirname(_sys.executable), "spe_tuner_winpos.json")
+else:
+    _winpos_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spe_tuner_winpos.json")
+
+
+def load_winpos():
+    try:
+        with open(_winpos_path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_winpos(x, y):
+    with open(_winpos_path, "w") as f:
+        json.dump({"x": x, "y": y}, f, indent=2)
+
 
 def save_config(c):
     with open(_cfg_path, "w") as f:
@@ -565,6 +586,7 @@ def manual_tune(callback):
         callback("done", None)
         return
 
+    orig_mode = latest["modulation"].get(trx)
     ws = websocket.create_connection(_tci_url(), timeout=5)
     try:
         callback("status", f"MANUAL TUNE RX{trx+1}: {freq/1_000_000:.3f} MHz")
@@ -585,6 +607,9 @@ def manual_tune(callback):
     finally:
         try: set_tx(ws, False, trx)
         except: pass
+        if orig_mode and orig_mode != "CW":
+            try: ws.send(f"modulation:{trx},{orig_mode};")
+            except: pass
         ws.close()
 
     stop_requested.clear()
@@ -603,6 +628,7 @@ def run_tune(band, callback):
 
     trx = latest["tx_trx"]
     restore_freq = latest["freq_rx1"] if trx == 1 else latest["freq_rx0"]
+    orig_mode = latest["modulation"].get(trx)
     start_f, end_f = BANDS[band]
     ws = websocket.create_connection(_tci_url(), timeout=5)
     try:
@@ -633,6 +659,9 @@ def run_tune(band, callback):
     finally:
         try: set_tx(ws, False, trx)
         except: pass
+        if orig_mode and orig_mode != "CW":
+            try: ws.send(f"modulation:{trx},{orig_mode};")
+            except: pass
         if restore_freq:
             try: set_freq(ws, restore_freq, trx)
             except: pass
@@ -902,6 +931,10 @@ class TunerGUI:
         self._bind_drag_recursive(self.root)
         self._set_controls("disabled")
         root.update_idletasks()
+        winpos = load_winpos()
+        if "x" in winpos and "y" in winpos:
+            root.geometry(f"+{winpos['x']}+{winpos['y']}")
+        root.attributes("-topmost", True)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self.process_queue)
 
@@ -919,7 +952,7 @@ class TunerGUI:
 
         # ── Huvudrad: liggande kort ──────────────────────────────
         main = ctk.CTkFrame(r, fg_color="transparent")
-        main.pack(fill="x", padx=M["panel_pad"], pady=(M["panel_pad"], 0))
+        main.pack(fill="x", padx=M["panel_pad"], pady=(M["panel_pad"] - 3, 0))
         self._meters_frame = main       # ankare för larm-/okänd-banner (pack after=)
 
         # Kort A — status / AMP -----------------------------------
@@ -1048,10 +1081,19 @@ class TunerGUI:
     def _drag_start(self, e):
         self._drag_off = (e.x_root - self.root.winfo_x(),
                           e.y_root - self.root.winfo_y())
+        self._dragged = False
 
     def _drag_move(self, e):
         ox, oy = self._drag_off
-        self.root.geometry(f"+{e.x_root - ox}+{e.y_root - oy}")
+        x, y = e.x_root - ox, e.y_root - oy
+        x, y = win_snap.snap(self.root.title(), x, y,
+                              self.root.winfo_width(), self.root.winfo_height())
+        self._dragged = True
+        self.root.geometry(f"+{x}+{y}")
+
+    def _drag_end(self, e):
+        if getattr(self, "_dragged", False):
+            save_winpos(self.root.winfo_x(), self.root.winfo_y())
 
     def _show_menu(self, e):
         m = tk.Menu(self.root, tearoff=0, bg=PANEL, fg=TEXT,
@@ -1073,6 +1115,7 @@ class TunerGUI:
         try:
             w.bind("<ButtonPress-1>", self._drag_start, add="+")
             w.bind("<B1-Motion>", self._drag_move, add="+")
+            w.bind("<ButtonRelease-1>", self._drag_end, add="+")
             w.bind("<Button-3>", self._show_menu, add="+")
         except tk.TclError:
             pass

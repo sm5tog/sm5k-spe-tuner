@@ -152,14 +152,14 @@ latest = {
 6. `send_tune()` via RS232
 7. Poll `flags["tune"]` true → false (max 10s)
 8. TX OFF: `tune:TRX,false;`
-9. Återställ frekvens i `finally`
+9. Återställ ursprungligt mode i `finally` (från v1.2.1): `orig_mode = latest["modulation"].get(trx)` snapshottas innan steg 2, `modulation:TRX,{orig_mode};` skickas om `orig_mode` finns och skiljer sig från `CW`. Ingen explicit drive-återställning — effektregleringsloopen normaliserar automatiskt mot rätt börvärde när moduleringen är rätt igen.
 
 ### Tune, sweep
 - Bestäm segment från VFO via `freq_to_band(freq)`
-- Spara `restore_freq` innan sweep
+- Spara `restore_freq` och `orig_mode` innan sweep
 - Stega 20 kHz per steg, startar 1 kHz in i bandet (`f = start_f + 1000`)
 - Kör manual tune-flöde på varje frekvens
-- Återställ alltid `restore_freq` i `finally`
+- Återställ alltid `restore_freq` och `orig_mode` i `finally`
 - `stop_requested` (threading.Event) — STOP avbryter
 
 ### Bandplan
