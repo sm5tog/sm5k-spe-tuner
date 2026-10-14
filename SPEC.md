@@ -358,7 +358,6 @@ cd "C:\claude\Tune\sm5k-spe-tuner"
 python -m PyInstaller SM5K_SPE_Tuner.spec
 ```
 - Python 3.14, PyInstaller 6.20
-- Spec-filen kopierar automatiskt EXE till `C:\claude\aktiv\tune\SM5K_SPE_Tuner.exe`
 - GitHub: https://github.com/sm5tog/sm5k-spe-tuner
 
 ---
