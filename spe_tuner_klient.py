@@ -693,24 +693,41 @@ class Meter(ctk.CTkFrame):
         self.bar.set(0)
         self.bar.pack(anchor="w", padx=12, pady=(4, 10))
 
+    # Redraw bara vid ändring: varje CTk-configure ritar om en canvas.
+    _last = None
+    _last_hl = None
+    _last_pct = None
+
     def set(self, value, text):
-        pct = min(max(value/self._max, 0.0), 1.0)
+        pct = round(min(max(value/self._max, 0.0), 1.0) * self.BAR_W) / self.BAR_W
         col = GREEN
         for thresh, c in self._thresholds:
             if value >= thresh: col = c
-        self.val_lbl.configure(text=text, text_color=col)
-        self.bar.configure(progress_color=col)
-        self.bar.set(pct)
+        if self._last != (text, col):
+            self._last = (text, col)
+            self.val_lbl.configure(text=text, text_color=col)
+        if self._last_pct != (pct, col):
+            self._last_pct = (pct, col)
+            self.bar.configure(progress_color=col)
+            self.bar.set(pct)
 
     def clear(self):
-        self.val_lbl.configure(text="---", text_color=TEXT)
-        self.bar.set(0)
+        if self._last != ("---", TEXT):
+            self._last = ("---", TEXT)
+            self.val_lbl.configure(text="---", text_color=TEXT)
+        if self._last_pct != (0, None):
+            self._last_pct = (0, None)
+            self.bar.set(0)
 
     def highlight(self, on):
+        if self._last_hl == on:
+            return
+        self._last_hl = on
         self.configure(fg_color=TXTINT if on else PANEL,
                        border_color=RED if on else BORDER)
         self._hdr.configure(fg_color="transparent")
         self.val_lbl.configure(text_color=WHITE if on else TEXT)
+        self._last = None   # text_color ändrades här, tvinga omsättning i nästa set/clear
 
 
 # ──────────────────────────────────────────────────────────
@@ -744,12 +761,15 @@ class CollapsibleSection(ctk.CTkFrame):
 # ──────────────────────────────────────────────────────────
 
 class SettingsDialog(ctk.CTkToplevel):
+    """Byggs en gång dolt strax efter start (customtkinter-widgets är dyra att skapa,
+    ~0,6-1,0 s) och visas/döljs därefter med show()/hide() i stället för att byggas om."""
     def __init__(self, parent):
         super().__init__(parent)
+        self.withdraw()
         self.title("Settings")
         self.configure(fg_color=BG)
         self.resizable(False, False)
-        self.after(200, self.grab_set)   # CTkToplevel: vänta tills fönstret ritats
+        self.protocol("WM_DELETE_WINDOW", self.hide)
 
         self._f_lbl = th.font("label")
         self._f_hdr = th.font("small", bold=True)
@@ -808,7 +828,7 @@ class SettingsDialog(ctk.CTkToplevel):
 
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(fill="x", padx=16, pady=10)
-        ctk.CTkButton(btn_row, text="Cancel", command=self.destroy,
+        ctk.CTkButton(btn_row, text="Cancel", command=self.hide,
                       fg_color=BTNBG, hover_color=BTNHOV, text_color=BTNFG,
                       font=self._f_ent, corner_radius=RADIUS, width=90,
                       height=th.METRICS["btn_height"]).pack(side="right", padx=(6, 0))
@@ -816,6 +836,29 @@ class SettingsDialog(ctk.CTkToplevel):
                       fg_color=BLUE, hover_color=BLUE_B, text_color=WHITE,
                       font=self._f_ent, corner_radius=RADIUS, width=90,
                       height=th.METRICS["btn_height"]).pack(side="right")
+
+    def show(self):
+        """Läs om värden från cfg och visa den färdigbyggda dialogen."""
+        self._reload()
+        self.deiconify()
+        self.lift()
+        self.after(100, self.grab_set)   # grab kräver ett synligt fönster
+
+    def hide(self):
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.withdraw()
+
+    def _reload(self):
+        for key, (var, typ) in self._vars.items():
+            var.set(str(cfg[key]))
+        radios = cfg.get("radios", DEFAULT_CONFIG["radios"])
+        for ri, rvars in enumerate(self._rvars):
+            src = radios[ri] if ri < len(radios) else DEFAULT_RADIO
+            for key, (var, typ) in rvars.items():
+                var.set(str(src.get(key, DEFAULT_RADIO.get(key, ""))))
 
     def _section_label(self, text):
         ctk.CTkLabel(self, text=text, text_color=MUTED, font=th.font("small", bold=True),
@@ -841,7 +884,7 @@ class SettingsDialog(ctk.CTkToplevel):
         cfg["radios"] = radios
 
         save_config(cfg)
-        self.destroy()
+        self.hide()
 
 # ──────────────────────────────────────────────────────────
 # STÄNGNINGSDIALOG
@@ -937,6 +980,7 @@ class TunerGUI:
         root.attributes("-topmost", True)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self.process_queue)
+        self.root.after(1500, self._prebuild_settings)   # bygg Inställningar dolt efter start
 
     # ── Layout ──────────────────────────────────────────────
 
@@ -968,7 +1012,7 @@ class TunerGUI:
         cfg_btn = ctk.CTkButton(topA, text="⚙", width=28,
                                 height=M["btn_height"], corner_radius=RADIUS,
                                 fg_color=BTNBG, hover_color=BTNHOV, text_color=MUTED,
-                                font=F["head"], command=lambda: SettingsDialog(self.root))
+                                font=F["head"], command=self._open_settings)
         cfg_btn.pack(side="left", padx=(4, 0))
         self.tci_lbl    = tk.Label(cA, text="TCI: ---",    bg=PANEL, fg=MUTED,
                                    font=("Segoe UI", 9), anchor="w")
@@ -1012,11 +1056,8 @@ class TunerGUI:
         self._reg_plus = ctk.CTkButton(rowD3, text="+", width=26,
                                        command=self._reg_increase, **dbtn)
         self._reg_plus.pack(side="left")
-        self._reg_btn = ctk.CTkButton(rowD3, text="●", width=26, height=M["btn_height"],
-                                      corner_radius=RADIUS, fg_color=BTNBG,
-                                      hover_color=BTNHOV, text_color=GREEN, font=F["btn"],
-                                      command=self._reg_toggle)
-        self._reg_btn.pack(side="left", padx=(6, 0))
+        self._reg_state       = None
+        self._reg_skydd_until = 0.0
         self._reg_active = True
         self._reg_update_label()
 
@@ -1060,6 +1101,11 @@ class TunerGUI:
         self.tx_lbl.pack(side="left", padx=(2, 14))
         self.band_lbl.pack(side="left", padx=(0, 14))
         self.temp_lbl.pack(side="left")
+        self._reg_status_lbl = tk.Label(info, text="", bg=BG, fg=MUTED,
+                                        font=("Segoe UI", 10), anchor="w", cursor="hand2")
+        self._reg_status_lbl.pack(side="left", padx=(14, 0))
+        self._reg_status_lbl.bind("<Button-1>", lambda e: self._reg_toggle())
+        self._reg_refresh_idle()
         self.freq_lbl.pack(side="right", padx=(0, 4))
         self.radio_lbl.pack(side="right", padx=(0, 14))
         self.freq_lbl.bind("<Button-1>", lambda e: self._toggle_rx())
@@ -1098,7 +1144,7 @@ class TunerGUI:
     def _show_menu(self, e):
         m = tk.Menu(self.root, tearoff=0, bg=PANEL, fg=TEXT,
                     activebackground=BORDER, activeforeground=TEXT, bd=0)
-        m.add_command(label="Settings…", command=lambda: SettingsDialog(self.root))
+        m.add_command(label="Settings…", command=self._open_settings)
         m.add_separator()
         m.add_command(label="Avsluta", command=self._on_close)
         try:
@@ -1184,8 +1230,49 @@ class TunerGUI:
         tp   = cfg["target_power"].get(mode, 300) if mode else "---"
         lbl  = f"{tp}W" if isinstance(tp, int) else tp
         self._reg_lbl.config(text=lbl)
-        col = GREEN if (self._reg_active and mode) else MUTED
-        self._reg_btn.configure(text_color=col)
+        self._reg_refresh_idle()
+
+    _REG_STATES = {
+        "av":    ("av",    MUTED),
+        "vilar": ("vilar", MUTED),
+        "redo":  ("redo",  GREEN),
+        "soker": ("söker", AMBER),
+        "stabil": ("stabil", GREEN_B),
+        "skydd": ("skydd", RED),
+    }
+
+    def _reg_idle_state(self):
+        if not self._reg_active:
+            return "av"
+        if not self._reg_mode() or not self._op_on:
+            return "vilar"
+        return "redo"
+
+    def _reg_refresh_idle(self):
+        """Uppdatera statusraden när regleringsloopen inte körs (ingen TX)."""
+        if not self._tx_on:
+            self._reg_set_state(self._reg_idle_state())
+
+    def _reg_set_state(self, state):
+        """Visa REG-tillstånd och aktuellt drive-värde i statusraden."""
+        if not hasattr(self, "_reg_status_lbl"):
+            return
+        if state != "skydd" and time.monotonic() < self._reg_skydd_until:
+            state = "skydd"
+        trx = latest["tx_trx"]
+        if latest["tune_active"].get(trx, False):
+            drive = latest["tune_drive"].get(trx, 100)
+        else:
+            drive = latest["drive"].get(trx, 100)
+        text, col = self._REG_STATES[state]
+        label = f"REG: {text}"
+        if state in ("soker", "stabil", "skydd"):
+            label += f"  drive {drive}"
+        key = (label, col)
+        if key == self._reg_state:
+            return
+        self._reg_state = key
+        self._reg_status_lbl.config(text=label, fg=col)
 
     def _reg_apply_ff(self):
         """Skicka FF-drive direkt via TCI om kurvan har ett lärt värde för nuvarande band/target."""
@@ -1249,9 +1336,11 @@ class TunerGUI:
         tx_on = self._tx_on
 
         if mode not in ("CW", "DIGU") or not self._reg_active or not self._op_on:
+            self._reg_set_state(self._reg_idle_state())
             return
 
         if not tx_on:
+            self._reg_set_state("redo")
             self._power_history.clear()
             self._power_history_slow.clear()
             self._reg_ff_applied    = False
@@ -1302,6 +1391,7 @@ class TunerGUI:
             if ff_drive is not None and ff_drive != current_drive:
                 set_drive(ff_drive)
                 _reg_logger.info(f"{ts},FF,{band},{mode},{target},{measured_w:.0f},,{current_drive},{ff_drive},feed-forward {rx_tag}")
+            self._reg_set_state("soker")
             return  # vänta en cykel på att drive ska sätta sig
 
         # ── Klassificera mätpunkten ──────────────────────────────
@@ -1328,6 +1418,8 @@ class TunerGUI:
                 new_drive = max(current_drive - step, 0)
                 set_drive(new_drive)
                 _reg_logger.info(f"{ts},SKYDD,{band},{mode},{target},{measured_w:.0f},,{current_drive},{new_drive},step={step} {rx_tag}")
+                self._reg_skydd_until = now + 1.0
+            self._reg_set_state("skydd")
             return
 
         if is_transient:
@@ -1342,12 +1434,14 @@ class TunerGUI:
             n = len(self._power_history_slow)
             if n < 50:
                 _reg_logger.info(f"{ts},FAS2,{band},{mode},{target},{measured_w:.0f},,{current_drive},,n={n}/50")
+                self._reg_set_state("stabil")
                 return
             avg   = sum(self._power_history_slow) / n
             error = avg - target
             self._power_history_slow.clear()
             if abs(error) < 10:
                 _reg_logger.info(f"{ts},FAS2-OK,{band},{mode},{target},{measured_w:.0f},{avg:.0f},{current_drive},,stabil")
+                self._reg_set_state("stabil")
                 return
             # Drift utanför tolerans → 1-stegs korrigering, tillbaka till fas 1
             self._curve_add_point(band, current_drive, avg)
@@ -1357,9 +1451,11 @@ class TunerGUI:
             new_drive = max(current_drive - step, 0) if error > 0 else min(current_drive + step, 100)
             set_drive(new_drive)
             _reg_logger.info(f"{ts},FAS2-drift,{band},{mode},{target},{measured_w:.0f},{avg:.0f},{current_drive},{new_drive},→fas1")
+            self._reg_set_state("soker")
             return
 
         # ── Fas 1: aktiv sökning med rullande medelvärde (~2s) ──
+        self._reg_set_state("soker")
         if is_valid:
             self._power_history.append(measured_w)
         n = len(self._power_history)
@@ -1380,6 +1476,7 @@ class TunerGUI:
                 self._reg_phase2       = True
                 self._reg_stable_since = None
                 self._power_history_slow.clear()
+                self._reg_set_state("stabil")
                 _reg_logger.info(f"{ts},FAS1→FAS2,{band},{mode},{target},{measured_w:.0f},{avg:.0f},{current_drive},,stabil 2s {rx_tag}")
             else:
                 _reg_logger.info(f"{ts},FAS1-stabil,{band},{mode},{target},{measured_w:.0f},{avg:.0f},{current_drive},,inom 10W")
@@ -1533,6 +1630,28 @@ class TunerGUI:
     def callback(self, event, data): self.queue.put((event, data))
     def _log(self, msg): self.queue.put(("log", msg))
 
+    _alarm_shown = True   # första varvet gör pack_forget en gång
+
+    def _cfg_if(self, widget, **kw):
+        """configure() bara om något värde ändrats sedan förra anropet (undviker onödig omritning)."""
+        cache = self.__dict__.setdefault("_cfg_cache", {})
+        if cache.get(id(widget)) == kw:
+            return
+        cache[id(widget)] = kw
+        widget.configure(**kw)
+
+    # ── Inställningsdialog (byggs en gång, dold) ─────────────
+
+    _settings_dlg = None
+
+    def _prebuild_settings(self):
+        if self._settings_dlg is None:
+            self._settings_dlg = SettingsDialog(self.root)
+
+    def _open_settings(self):
+        self._prebuild_settings()
+        self._settings_dlg.show()
+
     def process_queue(self):
         try:
             while True:
@@ -1597,6 +1716,7 @@ class TunerGUI:
                     else:
                         self._power_display.clear()
                         self.power_meter.clear()
+                        self._reg_refresh_idle()
 
                     # TX — 400 ms debounce mot falskt TX-flimmer
                     if "tx" in data:
@@ -1609,7 +1729,7 @@ class TunerGUI:
                             self._tx_pending_since = None
                             on = False
                         self._tx_on = on
-                        self.tx_lbl.config(
+                        self._cfg_if(self.tx_lbl,
                             text="● TX ON" if on else "TX: OFF",
                             bg=RED if on else BG,
                             fg="white" if on else MUTED)
@@ -1623,14 +1743,14 @@ class TunerGUI:
                             self._band_pending = (b, time.monotonic())
                         elif time.monotonic() - self._band_pending[1] >= 0.50:
                             self._current_band = b
-                            self.band_lbl.config(text=f"Band: {b}", fg=TEXT)
+                            self._cfg_if(self.band_lbl, text=f"Band: {b}", fg=TEXT)
 
                     if "temp" in data and data["temp"] is not None:
                         t    = data["temp"]
                         unit = data.get("temp_unit", "°C")
                         t_c  = (t - 32) / 1.8 if unit == "°F" else t
                         tc   = RED if t_c >= 83 else (AMBER if t_c >= 70 else TEXT)
-                        self.temp_lbl.config(text=f"Temp: {t}{unit}", fg=tc)
+                        self._cfg_if(self.temp_lbl, text=f"Temp: {t}{unit}", fg=tc)
 
                     # OP — 2-pakets-konsensus + settling-fönster
                     if "op" in data:
@@ -1676,14 +1796,16 @@ class TunerGUI:
                         self.alarm_lbl.pack(fill="x", after=self._meters_frame)
                         self.log.insert(tk.END, f"ALARM: {msg}\n")
                         self.log.see(tk.END)
-                    else:
+                        self._alarm_shown = True
+                    elif self._alarm_shown:
                         self.alarm_lbl.pack_forget()
+                        self._alarm_shown = False
 
                     if "ant" in data and data["ant"] is not None:
-                        self.ant_btn.configure(text=f"ANT: {data['ant']}")
+                        self._cfg_if(self.ant_btn, text=f"ANT: {data['ant']}")
 
                     if "power_mode" in data and data["power_mode"]:
-                        self.power_btn.configure(text=f"Pwr: {data['power_mode']}")
+                        self._cfg_if(self.power_btn, text=f"Pwr: {data['power_mode']}")
 
                     if "input" in data:
                         self._handle_input_change(data["input"], data.get("radio"))
