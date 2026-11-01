@@ -19,6 +19,9 @@ import subprocess
 import sys
 import webbrowser
 import websocket
+from spe_logic import BANDS, freq_to_band, curve_interpolate, curve_update
+from spe_net import start_command_writer
+from spe_bridge import POLL_MS
 import serial
 
 __version__      = "1.2.1"
@@ -50,26 +53,6 @@ BAUDRATE    = 9600    # Fast i slutsteget, ej valbar
 SWEEP_STEP  = 20000   # Hz per sweep-steg
 FREQ_SETTLE = 1.0     # Sekunder att vänta efter VFO-byte
 PAUSE_STEP  = 1.0     # Sekunder mellan sweep-steg
-
-BANDS = {
-    "160l": (1810000,  1838000),  "160h": (1840000,  2000000),
-    "80l":  (3500000,  3599000),  "80h":  (3600000,  3800000),
-    "40l":  (7000000,  7099000),  "40h":  (7100000,  7200000),
-    "30l":  (10100000, 10150000),
-    "20l":  (14000000, 14099000), "20h":  (14100000, 14350000),
-    "17l":  (18068000, 18110000), "17h":  (18110000, 18168000),
-    "15l":  (21000000, 21099000), "15h":  (21100000, 21450000),
-    "12l":  (24890000, 24920000), "12h":  (24920000, 24990000),
-    "10l":  (28000000, 28099000), "10h":  (28100000, 29700000),
-    "6l":   (50000000, 50130000), "6h":   (50131000, 52000000),
-}
-
-def freq_to_band(freq):
-    """Returnerar bandnyckel (t.ex. '15l') för given frekvens, eller None."""
-    for key, (start, end) in BANDS.items():
-        if start <= freq <= end:
-            return key
-    return None
 
 import sys as _sys
 # Filen sparas bredvid EXE:n (frozen) eller bredvid .py-filen (script).
@@ -407,6 +390,7 @@ def _active_tx_freq():
 def tci_listener_loop(callback, running):
     while running["run"]:
         url = _tci_url()
+        w_stop = w_thread = None
         try:
             ws = websocket.create_connection(url, timeout=5)
             ws.settimeout(0.15)
@@ -421,6 +405,11 @@ def tci_listener_loop(callback, running):
             ws.send("tune_drive:1;")
             ws.send("tx_sensors_enable:true,100;")
 
+            def _wake_reader_tci(_e, ws=ws):
+                try: ws.close()
+                except Exception: pass
+            w_stop, w_thread = start_command_writer(ws.send, tci_cmd_queue, on_error=_wake_reader_tci)
+
             _keepalive_ticks = 0
             while running["run"]:
                 # Byt anslutning om aktiv radio ändrats
@@ -431,12 +420,6 @@ def tci_listener_loop(callback, running):
                     msg = ws.recv()
                     _keepalive_ticks = 0
                 except (websocket.WebSocketTimeoutException, socket.timeout):
-                    # Töm utgående kö även om inga inkommande meddelanden
-                    while not tci_cmd_queue.empty():
-                        try:
-                            ws.send(tci_cmd_queue.get_nowait())
-                        except Exception:
-                            pass
                     _keepalive_ticks += 1
                     if _keepalive_ticks >= 200:   # ~30 s
                         ws.send("vfo:0,0;")
@@ -540,15 +523,12 @@ def tci_listener_loop(callback, running):
                     except (ValueError, IndexError):
                         pass
 
-                # Skicka väntande utgående kommandon
-                while not tci_cmd_queue.empty():
-                    try:
-                        ws.send(tci_cmd_queue.get_nowait())
-                    except Exception:
-                        pass
-
         except Exception as e:
             callback("log", f"TCI error: {type(e).__name__}: {e}")
+        finally:
+            if w_stop is not None:
+                w_stop.set()
+                w_thread.join(0.5)
 
         latest["freq"] = None
         latest["freq_rx0"] = None
@@ -752,20 +732,35 @@ class Meter(tk.Frame):
         self.cv.pack(anchor="w", pady=(6, 0))
         self._bar = self.cv.create_rectangle(0, 0, 0, self.BAR_H, fill=GREEN, outline="")
 
+    # Rita bara vid ändring (samma mönster som klienten).
+    _last = None
+    _last_hl = None
+
     def set(self, value, text):
         pct = min(max(value/self._max, 0.0), 1.0)
         col = GREEN
         for thresh, c in self._thresholds:
             if value >= thresh: col = c
+        w = int(self.BAR_W*pct)
+        if self._last == (text, col, w):
+            return
+        self._last = (text, col, w)
         self.val_lbl.config(text=text, fg=col)
         self.cv.itemconfig(self._bar, fill=col)
-        self.cv.coords(self._bar, 0, 0, int(self.BAR_W*pct), self.BAR_H)
+        self.cv.coords(self._bar, 0, 0, w, self.BAR_H)
 
     def clear(self):
+        if self._last == ("---", TEXT, 0):
+            return
+        self._last = ("---", TEXT, 0)
         self.val_lbl.config(text="---", fg=TEXT)
         self.cv.coords(self._bar, 0, 0, 0, self.BAR_H)
 
     def highlight(self, on):
+        if self._last_hl == on:
+            return
+        self._last_hl = on
+        self._last = None   # fg ändras här, tvinga omsättning i nästa set/clear
         bg = TXINT if on else PANEL
         self.config(bg=bg)
         for w in self.winfo_children():
@@ -799,23 +794,40 @@ class CompactMeter(ctk.CTkFrame):
         self.bar.set(0)
         self.bar.pack(anchor="w", padx=12, pady=(4, 10))
 
+    # Redraw bara vid ändring: varje CTk-configure ritar om en canvas.
+    _last = None
+    _last_hl = None
+    _last_pct = None
+
     def set(self, value, text):
-        pct = min(max(value/self._max, 0.0), 1.0)
+        pct = round(min(max(value/self._max, 0.0), 1.0) * self.BAR_W) / self.BAR_W
         col = GREEN
         for thresh, c in self._thresholds:
             if value >= thresh: col = c
-        self.val_lbl.configure(text=text, text_color=col)
-        self.bar.configure(progress_color=col)
-        self.bar.set(pct)
+        if self._last != (text, col):
+            self._last = (text, col)
+            self.val_lbl.configure(text=text, text_color=col)
+        if self._last_pct != (pct, col):
+            self._last_pct = (pct, col)
+            self.bar.configure(progress_color=col)
+            self.bar.set(pct)
 
     def clear(self):
-        self.val_lbl.configure(text="---", text_color=TEXT)
-        self.bar.set(0)
+        if self._last != ("---", TEXT):
+            self._last = ("---", TEXT)
+            self.val_lbl.configure(text="---", text_color=TEXT)
+        if self._last_pct != (0, None):
+            self._last_pct = (0, None)
+            self.bar.set(0)
 
     def highlight(self, on):
+        if self._last_hl == on:
+            return
+        self._last_hl = on
         self.configure(fg_color=TXINT if on else PANEL,
                        border_color=RED if on else BORDER)
         self.val_lbl.configure(text_color=WHITE if on else TEXT)
+        self._last = None   # text_color ändrades här, tvinga omsättning i nästa set/clear
 
     def reconfigure(self, label, max_val, thresholds):
         self._hdr.configure(text=label)
@@ -1063,7 +1075,7 @@ class TunerGUI:
         self._set_controls("disabled")
         root.update_idletasks()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(100, self.process_queue)
+        self.root.after(POLL_MS, self.process_queue)
         self.root.after(2000, self._update_check_tick)
 
     # ── Layout ──────────────────────────────────────────────
@@ -1229,37 +1241,11 @@ class TunerGUI:
 
     def _curve_interpolate(self, band, target_w):
         """Returnerar interpolerat drive-värde för target_w från kurvan, eller None."""
-        pts = cfg["drive_curve"].get(band)
-        if not pts or len(pts) < 2:
-            return None
-        pairs = sorted(pts.items())   # [(drive, power), ...]
-        # Hitta omgivande punkter
-        for i in range(len(pairs) - 1):
-            d0, p0 = pairs[i]
-            d1, p1 = pairs[i + 1]
-            if p0 <= target_w <= p1 or p1 <= target_w <= p0:
-                if p1 == p0:
-                    return d0
-                t = (target_w - p0) / (p1 - p0)
-                return int(round(d0 + t * (d1 - d0)))
-        # Utanför kurvan — extrapolera från närmaste ände
-        d0, p0 = pairs[0];  d1, p1 = pairs[-1]
-        if target_w < min(p0, p1):
-            d, p = (d0, p0) if p0 < p1 else (d1, p1)
-            return max(0, min(100, d - 2))
-        else:
-            d, p = (d1, p1) if p1 > p0 else (d0, p0)
-            return max(0, min(100, d + 2))
+        return curve_interpolate(cfg["drive_curve"].get(band), target_w)
 
     def _curve_add_point(self, band, drive, power_w):
         """Lägger till eller uppdaterar en kurv-punkt och sparar."""
-        curve = cfg["drive_curve"].setdefault(band, {})
-        # Slå ihop med befintlig punkt om drive är samma
-        existing = curve.get(drive)
-        if existing is not None:
-            curve[drive] = round(0.7 * existing + 0.3 * power_w, 1)  # trög uppdatering
-        else:
-            curve[drive] = round(power_w, 1)
+        curve_update(cfg["drive_curve"].setdefault(band, {}), drive, power_w)
         save_config(cfg)
 
     def _reg_mode(self):
@@ -1608,7 +1594,12 @@ class TunerGUI:
             if dlg.result == "cancel":
                 return
             self._amp_disconnect()
-            time.sleep(1.0)
+            self.root.withdraw()
+            self.root.after(1000, self._finish_close)   # amp_off hinner ut innan seriporten stängs
+            return
+        self._finish_close()
+
+    def _finish_close(self):
         self._tci_running["run"] = False
         self.root.destroy()
 
@@ -1674,6 +1665,26 @@ class TunerGUI:
     def callback(self, event, data): self.queue.put((event, data))
     def _log(self, msg): self.queue.put(("log", msg))
 
+    LOG_MAX_LINES = 500
+
+    def _log_add(self, text):
+        """Lägger till en loggrad och kapar loggen i klump, så att tk.Text inte växer obegränsat."""
+        self.log.insert(tk.END, text)
+        n = int(self.log.index("end-1c").split(".")[0])
+        if n > self.LOG_MAX_LINES + 100:
+            self.log.delete("1.0", f"{n - self.LOG_MAX_LINES}.0")
+        self.log.see(tk.END)
+
+    _alarm_shown = False   # bannern är opackad från start
+
+    def _cfg_if(self, widget, **kw):
+        """configure() bara om något värde ändrats sedan förra anropet (undviker onödig omritning)."""
+        cache = self.__dict__.setdefault("_cfg_cache", {})
+        if cache.get(id(widget)) == kw:
+            return
+        cache[id(widget)] = kw
+        widget.configure(**kw)
+
     def process_queue(self):
         try:
             while True:
@@ -1681,13 +1692,11 @@ class TunerGUI:
 
                 if event == "status":
                     self.radio_lbl.config(text=data, fg=TEXT)
-                    self.log.insert(tk.END, f"{data}\n")
-                    self.log.see(tk.END)
+                    self._log_add(f"{data}\n")
 
                 elif event == "error":
                     self.radio_lbl.config(text=f"ERR: {data}", fg=RED)
-                    self.log.insert(tk.END, f"ERROR: {data}\n")
-                    self.log.see(tk.END)
+                    self._log_add(f"ERROR: {data}\n")
 
                 elif event == "done":
                     self.running = False
@@ -1698,8 +1707,7 @@ class TunerGUI:
 
                 elif event == "log":
                     ts = time.strftime("%H:%M:%S")
-                    self.log.insert(tk.END, f"{ts} {data}\n")
-                    self.log.see(tk.END)
+                    self._log_add(f"{ts} {data}\n")
 
                 elif event == "radio_freq":
                     trx = latest["tx_trx"]
@@ -1716,17 +1724,13 @@ class TunerGUI:
                     ok = data == "connected"
                     self.tci_lbl.config(text=f"TCI: {'OK' if ok else 'LOST'}",
                                         fg=GREEN if ok else RED)
-                    self.log.insert(tk.END,
-                        f"TCI: {'connected' if ok else 'lost'}\n")
-                    self.log.see(tk.END)
+                    self._log_add(f"TCI: {'connected' if ok else 'lost'}\n")
 
                 elif event == "serial_status":
                     ok = data == "connected"
                     self.serial_lbl.config(text=f"Serial: {'OK' if ok else 'LOST'}",
                                            fg=GREEN if ok else RED)
-                    self.log.insert(tk.END,
-                        f"Serial: {'connected' if ok else 'lost'}\n")
-                    self.log.see(tk.END)
+                    self._log_add(f"Serial: {'connected' if ok else 'lost'}\n")
 
                 elif event == "telemetry":
                     p = data.get("power")
@@ -1750,7 +1754,7 @@ class TunerGUI:
                             self._tx_pending_since = None
                             on = False
                         self._tx_on = on
-                        self.tx_lbl.config(
+                        self._cfg_if(self.tx_lbl,
                             text="● TX ON" if on else "TX: OFF",
                             bg=RED if on else BG,
                             fg="white" if on else MUTED)
@@ -1764,14 +1768,14 @@ class TunerGUI:
                             self._band_pending = (b, time.monotonic())
                         elif time.monotonic() - self._band_pending[1] >= 0.50:
                             self._current_band = b
-                            self.band_lbl.config(text=f"Band: {b}", fg=TEXT)
+                            self._cfg_if(self.band_lbl, text=f"Band: {b}", fg=TEXT)
 
                     if "temp" in data and data["temp"] is not None:
                         t    = data["temp"]
                         unit = data.get("temp_unit", "°C")
                         t_c  = (t - 32) / 1.8 if unit == "°F" else t
                         tc   = RED if t_c >= 83 else (AMBER if t_c >= 70 else TEXT)
-                        self.temp_lbl.config(text=f"Temp: {t}{unit}", fg=tc)
+                        self._cfg_if(self.temp_lbl, text=f"Temp: {t}{unit}", fg=tc)
 
                     # OP — 2-pakets-konsensus + settling-fönster
                     if "op" in data:
@@ -1813,18 +1817,20 @@ class TunerGUI:
                     warning = data.get("warning")
                     if alarm:
                         msg = warning if warning else "ALARM"
-                        self.alarm_lbl.config(text=f"  ⚠  {msg}  ⚠  ")
-                        self.alarm_lbl.pack(fill="x", after=self._meters_frame)
-                        self.log.insert(tk.END, f"ALARM: {msg}\n")
-                        self.log.see(tk.END)
-                    else:
+                        self._cfg_if(self.alarm_lbl, text=f"  ⚠  {msg}  ⚠  ")
+                        if not self._alarm_shown:
+                            self.alarm_lbl.pack(fill="x", after=self._meters_frame)
+                        self._log_add(f"ALARM: {msg}\n")
+                        self._alarm_shown = True
+                    elif self._alarm_shown:
                         self.alarm_lbl.pack_forget()
+                        self._alarm_shown = False
 
                     if "ant" in data and data["ant"] is not None:
-                        self.ant_btn.config(text=f"ANT: {data['ant']}")
+                        self._cfg_if(self.ant_btn, text=f"ANT: {data['ant']}")
 
                     if "power_mode" in data and data["power_mode"]:
-                        self.power_btn.config(text=f"Power: {data['power_mode']}")
+                        self._cfg_if(self.power_btn, text=f"Power: {data['power_mode']}")
 
                     if "input" in data:
                         self._handle_input_change(data["input"], data.get("radio"))
@@ -1832,7 +1838,7 @@ class TunerGUI:
         except queue.Empty:
             pass
 
-        self.root.after(100, self.process_queue)
+        self.root.after(POLL_MS, self.process_queue)
 
     def _last_radio_name(self):
         radio = find_radio(self._last_input) if self._last_input else None

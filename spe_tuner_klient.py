@@ -20,6 +20,9 @@ import socket
 import websocket
 
 import win_snap
+from spe_logic import BANDS, freq_to_band, curve_interpolate, curve_update
+from spe_net import start_command_writer
+from spe_bridge import TkBridge, POLL_MS
 
 # ──────────────────────────────────────────────────────────
 # CONFIG
@@ -42,26 +45,6 @@ DEFAULT_CONFIG = {
 SWEEP_STEP  = 20000   # Hz per sweep-steg
 FREQ_SETTLE = 1.0     # Sekunder att vänta efter VFO-byte
 PAUSE_STEP  = 1.0     # Sekunder mellan sweep-steg
-
-BANDS = {
-    "160l": (1810000,  1838000),  "160h": (1840000,  2000000),
-    "80l":  (3500000,  3599000),  "80h":  (3600000,  3800000),
-    "40l":  (7000000,  7099000),  "40h":  (7100000,  7200000),
-    "30l":  (10100000, 10150000),
-    "20l":  (14000000, 14099000), "20h":  (14100000, 14350000),
-    "17l":  (18068000, 18110000), "17h":  (18110000, 18168000),
-    "15l":  (21000000, 21099000), "15h":  (21100000, 21450000),
-    "12l":  (24890000, 24920000), "12h":  (24920000, 24990000),
-    "10l":  (28000000, 28099000), "10h":  (28100000, 29700000),
-    "6l":   (50000000, 50130000), "6h":   (50131000, 52000000),
-}
-
-def freq_to_band(freq):
-    """Returnerar bandnyckel (t.ex. '15l') för given frekvens, eller None."""
-    for key, (start, end) in BANDS.items():
-        if start <= freq <= end:
-            return key
-    return None
 
 import sys as _sys
 # Filen sparas bredvid EXE:n (frozen) eller bredvid .py-filen (script).
@@ -252,31 +235,24 @@ def ampd_listener_loop(callback, running):
     buf = b""
     while running["run"]:
         sock = None
+        w_stop = w_thread = None
         try:
             sock = socket.create_connection((cfg["ampd_host"], cfg["ampd_port"]), timeout=5)
             sock.settimeout(1.0)
             latest["ampd_connected"] = True
             callback("ampd_status", "connected")
-            last_heartbeat = 0.0
+
+            def _wake_reader(_e, sock=sock):
+                try: sock.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+
+            # Skrivartråden skickar kommandon direkt och heartbeat var 1:a s,
+            # oberoende av när nästa paket kommer in.
+            w_stop, w_thread = start_command_writer(
+                lambda m, sock=sock: sock.sendall((json.dumps(m) + "\n").encode("utf-8")),
+                ampd_cmd_queue, heartbeat=lambda: {"cmd": "heartbeat"}, on_error=_wake_reader)
 
             while running["run"]:
-                now = time.time()
-                if now - last_heartbeat >= 1.0:
-                    try:
-                        sock.sendall((json.dumps({"cmd": "heartbeat"}) + "\n").encode("utf-8"))
-                    except OSError:
-                        break
-                    last_heartbeat = now
-
-                while not ampd_cmd_queue.empty():
-                    try:
-                        cmd = ampd_cmd_queue.get_nowait()
-                        sock.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
-                    except OSError:
-                        break
-                    except queue.Empty:
-                        break
-
                 try:
                     chunk = sock.recv(4096)
                     if not chunk:
@@ -298,6 +274,9 @@ def ampd_listener_loop(callback, running):
         except Exception as e:
             callback("log", f"AMPD error: {type(e).__name__}: {e}")
         finally:
+            if w_stop is not None:
+                w_stop.set()
+                w_thread.join(0.5)
             if sock:
                 try: sock.close()
                 except: pass
@@ -347,6 +326,7 @@ def _active_tx_freq():
 def tci_listener_loop(callback, running):
     while running["run"]:
         url = _tci_url()
+        w_stop = w_thread = None
         try:
             ws = websocket.create_connection(url, timeout=5)
             ws.settimeout(0.15)
@@ -361,6 +341,11 @@ def tci_listener_loop(callback, running):
             ws.send("tune_drive:1;")
             ws.send("tx_sensors_enable:true,100;")
 
+            def _wake_reader_tci(_e, ws=ws):
+                try: ws.close()
+                except Exception: pass
+            w_stop, w_thread = start_command_writer(ws.send, tci_cmd_queue, on_error=_wake_reader_tci)
+
             _keepalive_ticks = 0
             while running["run"]:
                 # Byt anslutning om aktiv radio ändrats
@@ -371,12 +356,6 @@ def tci_listener_loop(callback, running):
                     msg = ws.recv()
                     _keepalive_ticks = 0
                 except (websocket.WebSocketTimeoutException, socket.timeout):
-                    # Töm utgående kö även om inga inkommande meddelanden
-                    while not tci_cmd_queue.empty():
-                        try:
-                            ws.send(tci_cmd_queue.get_nowait())
-                        except Exception:
-                            pass
                     _keepalive_ticks += 1
                     if _keepalive_ticks >= 200:   # ~30 s
                         ws.send("vfo:0,0;")
@@ -480,15 +459,12 @@ def tci_listener_loop(callback, running):
                     except (ValueError, IndexError):
                         pass
 
-                # Skicka väntande utgående kommandon
-                while not tci_cmd_queue.empty():
-                    try:
-                        ws.send(tci_cmd_queue.get_nowait())
-                    except Exception:
-                        pass
-
         except Exception as e:
             callback("log", f"TCI error: {type(e).__name__}: {e}")
+        finally:
+            if w_stop is not None:
+                w_stop.set()
+                w_thread.join(0.5)
 
         latest["freq"] = None
         latest["freq_rx0"] = None
@@ -761,11 +737,19 @@ class CollapsibleSection(ctk.CTkFrame):
 # ──────────────────────────────────────────────────────────
 
 class SettingsDialog(ctk.CTkToplevel):
-    """Byggs en gång dolt strax efter start (customtkinter-widgets är dyra att skapa,
-    ~0,6-1,0 s) och visas/döljs därefter med show()/hide() i stället för att byggas om."""
+    """Byggs en gång strax efter start och målas osynligt en gång (warm), därefter visas och
+    döljs den genom att flyttas in/ut ur bild med alpha 0/1. Första synliga målningen av
+    fönstret kostar 0,2-2,7 s (mätt 2026-11-01) men en omvisning av ett redan målat fönster
+    ca 10-60 ms, så målningen tas osynligt vid start i stället för vid klicket."""
+    PARK = "+-3000+-3000"
+
     def __init__(self, parent):
         super().__init__(parent)
         self.withdraw()
+        self.attributes("-alpha", 0.0)
+        self.transient(parent)          # ingen egen knapp i aktivitetsfältet när fönstret är mappat
+        self._parent = parent
+        self._mapped = False
         self.title("Settings")
         self.configure(fg_color=BG)
         self.resizable(False, False)
@@ -837,10 +821,26 @@ class SettingsDialog(ctk.CTkToplevel):
                       font=self._f_ent, corner_radius=RADIUS, width=90,
                       height=th.METRICS["btn_height"]).pack(side="right")
 
+    def _home(self):
+        return f"+{self._parent.winfo_x() + 30}+{self._parent.winfo_y() + 30}"
+
+    def warm(self):
+        """Osynlig första målning (alpha 0) och parkering utanför bild."""
+        if self._mapped:
+            return
+        self.wm_geometry(self._home())
+        self.deiconify()
+        self.update()
+        self.wm_geometry(self.PARK)
+        self._mapped = True
+
     def show(self):
         """Läs om värden från cfg och visa den färdigbyggda dialogen."""
         self._reload()
-        self.deiconify()
+        if not self._mapped:
+            self.warm()
+        self.wm_geometry(self._home())
+        self.attributes("-alpha", 1.0)
         self.lift()
         self.after(100, self.grab_set)   # grab kräver ett synligt fönster
 
@@ -849,7 +849,8 @@ class SettingsDialog(ctk.CTkToplevel):
             self.grab_release()
         except tk.TclError:
             pass
-        self.withdraw()
+        self.attributes("-alpha", 0.0)
+        self.wm_geometry(self.PARK)
 
     def _reload(self):
         for key, (var, typ) in self._vars.items():
@@ -929,6 +930,7 @@ class TunerGUI:
     def __init__(self, root):
         self.root            = root
         self.queue           = queue.Queue()
+        self.bridge          = TkBridge(root)
         self.running         = False
         self._last_input     = None
         self._locked         = False
@@ -979,8 +981,9 @@ class TunerGUI:
             root.geometry(f"+{winpos['x']}+{winpos['y']}")
         root.attributes("-topmost", True)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(100, self.process_queue)
+        self.root.after(POLL_MS, self.process_queue)
         self.root.after(1500, self._prebuild_settings)   # bygg Inställningar dolt efter start
+        self.root.after(4000, self._warm_settings)       # osynlig första målning, se SettingsDialog
 
     # ── Layout ──────────────────────────────────────────────
 
@@ -1186,37 +1189,11 @@ class TunerGUI:
 
     def _curve_interpolate(self, band, target_w):
         """Returnerar interpolerat drive-värde för target_w från kurvan, eller None."""
-        pts = cfg["drive_curve"].get(band)
-        if not pts or len(pts) < 2:
-            return None
-        pairs = sorted(pts.items())   # [(drive, power), ...]
-        # Hitta omgivande punkter
-        for i in range(len(pairs) - 1):
-            d0, p0 = pairs[i]
-            d1, p1 = pairs[i + 1]
-            if p0 <= target_w <= p1 or p1 <= target_w <= p0:
-                if p1 == p0:
-                    return d0
-                t = (target_w - p0) / (p1 - p0)
-                return int(round(d0 + t * (d1 - d0)))
-        # Utanför kurvan — extrapolera från närmaste ände
-        d0, p0 = pairs[0];  d1, p1 = pairs[-1]
-        if target_w < min(p0, p1):
-            d, p = (d0, p0) if p0 < p1 else (d1, p1)
-            return max(0, min(100, d - 2))
-        else:
-            d, p = (d1, p1) if p1 > p0 else (d0, p0)
-            return max(0, min(100, d + 2))
+        return curve_interpolate(cfg["drive_curve"].get(band), target_w)
 
     def _curve_add_point(self, band, drive, power_w):
         """Lägger till eller uppdaterar en kurv-punkt och sparar."""
-        curve = cfg["drive_curve"].setdefault(band, {})
-        # Slå ihop med befintlig punkt om drive är samma
-        existing = curve.get(drive)
-        if existing is not None:
-            curve[drive] = round(0.7 * existing + 0.3 * power_w, 1)  # trög uppdatering
-        else:
-            curve[drive] = round(power_w, 1)
+        curve_update(cfg["drive_curve"].setdefault(band, {}), drive, power_w)
         save_config(cfg)
 
     def _reg_mode(self):
@@ -1563,7 +1540,12 @@ class TunerGUI:
             if dlg.result == "cancel":
                 return
             self._amp_disconnect()
-            time.sleep(1.0)
+            self.root.withdraw()
+            self.bridge.schedule(1000, self._finish_close)   # amp_off hinner ut via skrivartråden
+            return
+        self._finish_close()
+
+    def _finish_close(self):
         self._tci_running["run"]  = False
         self._ampd_running["run"] = False
         self.root.destroy()
@@ -1630,6 +1612,16 @@ class TunerGUI:
     def callback(self, event, data): self.queue.put((event, data))
     def _log(self, msg): self.queue.put(("log", msg))
 
+    LOG_MAX_LINES = 500
+
+    def _log_add(self, text):
+        """Lägger till en loggrad och kapar loggen i klump, så att tk.Text inte växer obegränsat."""
+        self.log.insert(tk.END, text)
+        n = int(self.log.index("end-1c").split(".")[0])
+        if n > self.LOG_MAX_LINES + 100:
+            self.log.delete("1.0", f"{n - self.LOG_MAX_LINES}.0")
+        self.log.see(tk.END)
+
     _alarm_shown = True   # första varvet gör pack_forget en gång
 
     def _cfg_if(self, widget, **kw):
@@ -1648,6 +1640,14 @@ class TunerGUI:
         if self._settings_dlg is None:
             self._settings_dlg = SettingsDialog(self.root)
 
+    def _warm_settings(self):
+        """Osynlig första målning av Inställningsdialogen. Skjuts upp under pågående TX."""
+        if self._tx_on or self.running:
+            self.root.after(5000, self._warm_settings)
+            return
+        self._prebuild_settings()
+        self._settings_dlg.warm()
+
     def _open_settings(self):
         self._prebuild_settings()
         self._settings_dlg.show()
@@ -1659,13 +1659,11 @@ class TunerGUI:
 
                 if event == "status":
                     self.radio_lbl.config(text=data, fg=TEXT)
-                    self.log.insert(tk.END, f"{data}\n")
-                    self.log.see(tk.END)
+                    self._log_add(f"{data}\n")
 
                 elif event == "error":
                     self.radio_lbl.config(text=f"ERR: {data}", fg=RED)
-                    self.log.insert(tk.END, f"ERROR: {data}\n")
-                    self.log.see(tk.END)
+                    self._log_add(f"ERROR: {data}\n")
 
                 elif event == "done":
                     self.running = False
@@ -1676,8 +1674,7 @@ class TunerGUI:
 
                 elif event == "log":
                     ts = time.strftime("%H:%M:%S")
-                    self.log.insert(tk.END, f"{ts} {data}\n")
-                    self.log.see(tk.END)
+                    self._log_add(f"{ts} {data}\n")
 
                 elif event == "radio_freq":
                     trx = latest["tx_trx"]
@@ -1694,17 +1691,13 @@ class TunerGUI:
                     ok = data == "connected"
                     self.tci_lbl.config(text=f"TCI: {'OK' if ok else 'LOST'}",
                                         fg=GREEN if ok else RED)
-                    self.log.insert(tk.END,
-                        f"TCI: {'connected' if ok else 'lost'}\n")
-                    self.log.see(tk.END)
+                    self._log_add(f"TCI: {'connected' if ok else 'lost'}\n")
 
                 elif event == "serial_status":
                     ok = data == "connected"
                     self.serial_lbl.config(text=f"Serial: {'OK' if ok else 'LOST'}",
                                            fg=GREEN if ok else RED)
-                    self.log.insert(tk.END,
-                        f"Serial: {'connected' if ok else 'lost'}\n")
-                    self.log.see(tk.END)
+                    self._log_add(f"Serial: {'connected' if ok else 'lost'}\n")
 
                 elif event == "telemetry":
                     p = data.get("power")
@@ -1794,8 +1787,7 @@ class TunerGUI:
                         msg = warning if warning else "ALARM"
                         self.alarm_lbl.config(text=f"  ⚠  {msg}  ⚠  ")
                         self.alarm_lbl.pack(fill="x", after=self._meters_frame)
-                        self.log.insert(tk.END, f"ALARM: {msg}\n")
-                        self.log.see(tk.END)
+                        self._log_add(f"ALARM: {msg}\n")
                         self._alarm_shown = True
                     elif self._alarm_shown:
                         self.alarm_lbl.pack_forget()
@@ -1813,7 +1805,8 @@ class TunerGUI:
         except queue.Empty:
             pass
 
-        self.root.after(100, self.process_queue)
+        self.bridge.drain()
+        self.root.after(POLL_MS, self.process_queue)
 
     def _last_radio_name(self):
         radio = find_radio(self._last_input) if self._last_input else None

@@ -393,3 +393,18 @@ python -m PyInstaller SM5K_SPE_Tuner.spec
 **Driftsättning (nuvarande instans):** `ramnas-station` (`192.168.68.107:5560`), eftersom slutsteget står i Ramnäs. USB-dongel: Prolific "ATEN USB to Serial Bridge" (`067b:23a3`), `pl2303`-drivrutinen inbyggd i Raspberry Pi OS Trixie, ingen extra installation.
 
 **GUI på fjärrmaskin — TCI-fallgrop:** `Settings → Radio N → TCI Host` får INTE stå kvar på `127.0.0.1` om GUI:t körs på en annan dator än den som kör ExpertSDR3 — det är bara loopback lokalt. Måste sättas till den datorns riktiga LAN-IP (t.ex. tomahawks `192.168.68.103`), samma port som vanligt.
+
+## Responsivitet och trådning (2026-11-01)
+
+Gäller `spe_tuner_klient.py` och `spe_tuner.py`. Logik utan GUI-import ligger i tre små moduler som båda programmen importerar och som testas i `tests/` (`python -m pytest tests -q`).
+
+| Modul | Innehåll |
+|---|---|
+| `spe_logic.py` | `BANDS`, `freq_to_band`, `curve_interpolate`, `curve_update` (drivkurvan). Reglerlogiken i `_regulation_step` ligger kvar i GUI-klassen (se TODO.md). |
+| `spe_net.py` | `command_writer` / `start_command_writer`: en skrivartråd per anslutning som blockerar på kommandokön och skickar direkt, med valfri heartbeat. |
+| `spe_bridge.py` | `TkBridge` (post/schedule/drain, bara GUI-tråden läser) och `FakeBridge` för tester. `POLL_MS = 20` är takten för `process_queue`. |
+
+- **Kommandon ut:** AMP ON/OFF, tangenttryck (`key`) och TCI-kommandon läggs i en kö och skickas av skrivartråden direkt. Före ändringen skickades de först när `recv` returnerade (ampd-slingan hade 1 s timeout, TCI-slingan 0,15 s). Heartbeat till `spe_ampd` skickas av samma skrivartråd var 1:a s. Skrivfel stänger anslutningen så att läsaren väcks och återanslutning sker som förut.
+- **GUI-tråden:** `process_queue` körs var 20 ms. Mätare, etiketter, knappar och larmbanderollen uppdateras bara när värdet ändrats. Loggen (`tk.Text`) kapas till de senaste ca 500 raderna.
+- **Inställningsdialogen (klienten):** byggs 1,5 s efter start och målas osynligt (alpha 0) första gången 4 s efter start (skjuts upp under TX/tune), därefter parkeras den utanför bild. Visa/dölj flyttar den och ändrar alpha, ingen `withdraw`/`deiconify`. Orsak: första synliga målningen av fönstret kostar 0,2-2,7 s, en omvisning av ett redan målat fönster 10-60 ms.
+- **Stängning:** `_on_close` gömmer fönstret och stänger 1 s senare via `after` i stället för `time.sleep` på GUI-tråden.
