@@ -822,7 +822,13 @@ class SettingsDialog(ctk.CTkToplevel):
                       height=th.METRICS["btn_height"]).pack(side="right")
 
     def _home(self):
-        return f"+{self._parent.winfo_x() + 30}+{self._parent.winfo_y() + 30}"
+        """Under huvudfönstret, vänsterkant i linje, inpassad så att hela dialogen ryms på skärmen."""
+        p = self._parent
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = min(p.winfo_x(), p.winfo_screenwidth() - w - 8)
+        y = p.winfo_y() + p.winfo_height() + 8
+        y = min(y, p.winfo_screenheight() - h - 48)   # lämna plats för aktivitetsfältet
+        return f"+{max(0, x)}+{max(0, y)}"
 
     def warm(self):
         """Osynlig första målning (alpha 0) och parkering utanför bild."""
@@ -840,7 +846,7 @@ class SettingsDialog(ctk.CTkToplevel):
         if not self._mapped:
             self.warm()
         self.wm_geometry(self._home())
-        self.attributes("-alpha", 1.0)
+        self.attributes("-alpha", 1.0, "-topmost", True)   # huvudfönstret är topmost
         self.lift()
         self.after(100, self.grab_set)   # grab kräver ett synligt fönster
 
@@ -849,7 +855,7 @@ class SettingsDialog(ctk.CTkToplevel):
             self.grab_release()
         except tk.TclError:
             pass
-        self.attributes("-alpha", 0.0)
+        self.attributes("-alpha", 0.0, "-topmost", False)
         self.wm_geometry(self.PARK)
 
     def _reload(self):
