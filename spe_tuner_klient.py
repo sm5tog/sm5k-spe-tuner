@@ -894,41 +894,6 @@ class SettingsDialog(ctk.CTkToplevel):
         self.hide()
 
 # ──────────────────────────────────────────────────────────
-# STÄNGNINGSDIALOG
-# ──────────────────────────────────────────────────────────
-
-class _CloseDialog(ctk.CTkToplevel):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.result = "cancel"
-        self.title("Avsluta")
-        self.configure(fg_color=BG)
-        self.resizable(False, False)
-        self.after(200, self.grab_set)
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-
-        ctk.CTkLabel(self, text="Stäng av slutsteget?", text_color=TEXT,
-                     font=th.font("body", bold=True)).pack(padx=28, pady=(20, 8))
-
-        f = ctk.CTkFrame(self, fg_color="transparent")
-        f.pack(fill="x", padx=20)
-
-        ctk.CTkButton(f, text="Stäng steget och avsluta",
-                      fg_color=STOPBG, hover_color=STOPBG, text_color=STOPFG,
-                      font=th.font("body"), corner_radius=RADIUS, height=34,
-                      command=lambda: self._set("yes")).pack(fill="x", pady=3)
-        ctk.CTkButton(f, text="Avbryt — stanna kvar",
-                      fg_color="transparent", hover_color=BORDER, text_color=MUTED,
-                      font=th.font("body"), corner_radius=RADIUS, height=34,
-                      command=self.destroy).pack(fill="x", pady=(3, 16))
-
-        self.wait_window()
-
-    def _set(self, result):
-        self.result = result
-        self.destroy()
-
-# ──────────────────────────────────────────────────────────
 # MAIN GUI
 # ──────────────────────────────────────────────────────────
 
@@ -1167,6 +1132,12 @@ class TunerGUI:
         skip = (ctk.CTkButton, ctk.CTkEntry, ctk.CTkTextbox, ctk.CTkSlider, ctk.CTkCheckBox)
         if isinstance(w, skip) or w in (self.freq_lbl, self.log):
             return
+        # CTk-widgetar binder sina inre widgetar själva: binds de en gång till här
+        # får ett högerklick två menyer efter varandra.
+        bound = self.__dict__.setdefault("_drag_bound", set())
+        if str(w) in bound:
+            return
+        bound.add(str(w))
         try:
             w.bind("<ButtonPress-1>", self._drag_start, add="+")
             w.bind("<B1-Motion>", self._drag_move, add="+")
@@ -1542,9 +1513,6 @@ class TunerGUI:
 
     def _on_close(self):
         if self._amp_connected:
-            dlg = _CloseDialog(self.root)
-            if dlg.result == "cancel":
-                return
             self._amp_disconnect()
             self.root.withdraw()
             self.bridge.schedule(1000, self._finish_close)   # amp_off hinner ut via skrivartråden

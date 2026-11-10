@@ -137,7 +137,7 @@ latest = {
 - **AMP: ON**: `_amp_connect()` anropas → `start_serial()` → porten öppnas, DTR hög → steget på
 - **AMP: OFF** (klick): `_amp_disconnect()` → `stop_serial()` → loopen avslutas → porten stängs, DTR låg
 - Kontrollknappar (Mode, ANT, Power, Tune) är disabled tills AMP: ON
-- Vid stängning: `_CloseDialog` frågar "Stäng av slutsteget?" om AMP är ON
+- Vid stängning (klienten `spe_tuner_klient.py`): ingen dialog. Är AMP ON anropas `_amp_disconnect()` och programmet avslutas efter 1 s. `spe_ampd` stänger dessutom av steget när sista klienten kopplar från. (Den lokala `spe_tuner.py` har kvar sin `_CloseDialog`.)
 
 ---
 
@@ -347,8 +347,8 @@ Faserna: FF, TRANSIENT, SKYDD, FAS1, FAS1-stabil, FAS1-väntar, FAS1-just, FAS1�
 
 ## Stängning
 - `WM_DELETE_WINDOW` → `_on_close()`
-- Om AMP ON: visa `_CloseDialog` ("Stäng av slutsteget?" / "Avbryt")
-- Vid bekräftelse: `_amp_disconnect()` + `time.sleep(1.0)` → `_tci_running["run"]=False` → `destroy()`
+- Klienten: om AMP ON → `_amp_disconnect()`, fönstret döljs, `_finish_close()` efter 1 s (amp_off hinner ut via skrivartråden) → `destroy()`. Ingen bekräftelsedialog.
+- Högerklicksmenyn (Settings…/Avsluta) binds en gång per widget (`_drag_bound`), CTk binder själv sina inre widgetar.
 
 ---
 
