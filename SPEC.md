@@ -284,8 +284,16 @@ oavsett band, antenn och driftsförhållanden. Aktiveras med REG-knappen.
 - Justeras med +/− knapparna (steg 10W). Gäller alla band.
 - Framtida: separata börvärden per band (HIGH/LOW-inställning på steget)
 
-### Feed-forward (FF)
-- Vid varje TX-start interpoleras ett känt drivenivåvärde ur inlärd kurva
+### Minne av senast stabila drive (från v1.2.2-arbetet, 2026-11-10)
+- `cfg["last_drive"]["{band}|{mode}|{HIGH/LOW}"] = {börvärde_W: drive}`, sparas i settings (överlever omstart). Ett värde per börvärde, så 300 W kan komma tillbaka efter ett byte till 200 W.
+- Sparas när regleringen blir stabil (FAS1 → FAS2), bara vid vanlig sändning, inte `tune_drive`
+- Effektläget (HIGH/LOW, `power_mode` i telemetrin) ingår i nyckeln både för minnet och för drivkurvan (`"{band}|{HIGH/LOW}"`). Okänt läge ger inget minne och ingen kurva, regleringen söker då. Gamla nycklar utan läge migrerades till LOW (Jonny kört LOW hittills, 2026-11-10).
+- Vid TX-start och vid börvärdesbyte med +/− används minnet för just det börvärdet först, annars kurvan (nedan).
+- Rörs inte av TX av, bara historiken nollställs. Funktion: `spe_logic.choose_ff_drive`.
+- Bandet för minne, FF och reglering kommer från radions TX-frekvens via TCI (`amp_band_from_freq`, BANDS utan l/h), reserv slutstegets rapporterade band. Slutstegets band släpar efter bandbyte (500 ms debounce + rapport först efter RF) och gav fel minne vid första TX efter bandbyte (loggen 2026-11-10). FF-raden i reglerloggen slutar på `band-TCI` eller `band-amp`.
+
+### Feed-forward (FF), reserv när inget minne finns
+- Vid TX-start interpoleras ett känt drivenivåvärde ur inlärd kurva
 - Kurvan (`cfg["drive_curve"]`) lagrar `{band: {drive: uppmätt_effekt}}`
 - Interpolering: linjär mellan närmaste kända punkter
 - Om kurva saknas → hoppa direkt till FAS1
@@ -395,6 +403,8 @@ python -m PyInstaller SM5K_SPE_Tuner.spec
 **GUI på fjärrmaskin — TCI-fallgrop:** `Settings → Radio N → TCI Host` får INTE stå kvar på `127.0.0.1` om GUI:t körs på en annan dator än den som kör ExpertSDR3 — det är bara loopback lokalt. Måste sättas till den datorns riktiga LAN-IP (t.ex. tomahawks `192.168.68.103`), samma port som vanligt.
 
 ## Responsivitet och trådning (2026-11-01)
+
+- `process_queue` (klienten) kör `_process_events` i ett skyddat block och planerar alltid nästa körning. Ett undantag loggas med traceback till `klient_fel.log` (gitignorad, max 200 poster per körning) och stoppar inte uppdateringen av GUI:t. Infört 2026-11-10 efter att ett saknat metodanrop frös GUI:t.
 
 Gäller `spe_tuner_klient.py` och `spe_tuner.py`. Logik utan GUI-import ligger i tre små moduler som båda programmen importerar och som testas i `tests/` (`python -m pytest tests -q`).
 

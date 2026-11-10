@@ -53,3 +53,31 @@ def curve_update(curve, drive, power_w):
         curve[drive] = round(0.7 * existing + 0.3 * power_w, 1)
     else:
         curve[drive] = round(power_w, 1)
+
+
+def last_drive_key(band, mode, pmode):
+    """Nyckel för minnet: band, mode (CW/DIGU) och slutstegets effektläge (HIGH/LOW)."""
+    return f"{band}|{mode}|{pmode}"
+
+
+def curve_key(band, pmode):
+    """Nyckel för drivkurvan: band och slutstegets effektläge (HIGH/LOW)."""
+    return f"{band}|{pmode}"
+
+
+def choose_ff_drive(last_drive, curve, band, mode, target_w, pmode):
+    """Drive att starta med: senast stabila drive för (band, mode, effektläge, börvärde),
+    annars interpolerat ur kurvan, annars None. last_drive: {"band|mode|pmode": {target: drive}}."""
+    mem = ((last_drive or {}).get(last_drive_key(band, mode, pmode)) or {}).get(int(target_w))
+    if mem is not None:
+        return int(mem)
+    return curve_interpolate(curve, target_w)
+
+
+def amp_band_from_freq(freq):
+    """Slutstegets bandnamn ('40', '30', '6' ...) ur en frekvens, eller None.
+    Samma nycklar som drivkurvan och last_drive använder (BANDS utan l/h-suffix)."""
+    if not freq:
+        return None
+    b = freq_to_band(freq)
+    return b[:-1] if b else None

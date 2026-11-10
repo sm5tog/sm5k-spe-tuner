@@ -20,7 +20,8 @@ import socket
 import websocket
 
 import win_snap
-from spe_logic import BANDS, freq_to_band, curve_interpolate, curve_update
+from spe_logic import (BANDS, freq_to_band, curve_interpolate, curve_update,
+                       choose_ff_drive, last_drive_key, curve_key, amp_band_from_freq)
 from spe_net import start_command_writer
 from spe_bridge import TkBridge, POLL_MS
 
@@ -34,7 +35,8 @@ DEFAULT_CONFIG = {
     "ampd_host": "192.168.68.107",
     "ampd_port": 5560,
     "target_power": {"CW": 300, "DIGU": 300},
-    "drive_curve":  {},   # {band: {drive: power}} — gemensam för alla modes
+    "drive_curve":  {},   # {"band|HIGH/LOW": {drive: power}} — gemensam för alla modes
+    "last_drive":   {},   # {"band|mode|HIGH/LOW": {börvärde_W: drive}} — senast stabila drive
     "radios": [
         {"name": "Radio 1", "input": 1, "tci_host": "127.0.0.1", "tci_port": 50001},
         {"name": "Radio 2", "input": 2, "tci_host": "127.0.0.1", "tci_port": 40001},
@@ -77,10 +79,25 @@ def load_config():
                     # Migrering från gammalt format (ett int-värde)
                     result["target_power"] = {"CW": int(tp), "DIGU": int(tp)}
             if "drive_curve" in saved:
+                # Gamla nycklar utan effektläge är inlärda i LOW (Jonny 2026-11-10)
                 result["drive_curve"] = {
-                    band: {int(k): float(v) for k, v in pts.items()}
+                    (band if "|" in band else f"{band}|LOW"):
+                        {int(k): float(v) for k, v in pts.items()}
                     for band, pts in saved["drive_curve"].items()
                 }
+            ld = saved.get("last_drive")
+            if isinstance(ld, dict):
+                out = {}
+                for k, v in ld.items():
+                    if not isinstance(v, dict):
+                        continue
+                    if k.count("|") == 1:          # gammal nyckel utan effektläge: inlärd i LOW
+                        k = f"{k}|LOW"
+                    if "drive" in v and "target" in v:      # gammalt format: ett värde
+                        out[k] = {int(v["target"]): int(v["drive"])}
+                    else:
+                        out[k] = {int(t): int(d) for t, d in v.items()}
+                result["last_drive"] = out
             return result
     except (FileNotFoundError, json.JSONDecodeError):
         return json.loads(json.dumps(DEFAULT_CONFIG))
@@ -932,6 +949,7 @@ class TunerGUI:
         self._band_pending         = None
         self._alarm_pending_since  = None
         self._current_band         = None
+        self._pwr_mode             = None   # slutstegets effektläge, HIGH/LOW (telemetri)
         self._reg_last_adjust      = 0.0
         self._reg_stable_since     = None
         self._reg_ff_applied       = False
@@ -1164,13 +1182,41 @@ class TunerGUI:
 
     # ── Effektreglering ──────────────────────────────────────
 
+    def _tx_band(self):
+        """Band för reglering och minne: från radions TX-frekvens (TCI, rätt redan vid TX-start),
+        reserv slutstegets rapporterade band (släpar efter bandbyte)."""
+        return amp_band_from_freq(_active_tx_freq()) or self._current_band
+
     def _curve_interpolate(self, band, target_w):
-        """Returnerar interpolerat drive-värde för target_w från kurvan, eller None."""
-        return curve_interpolate(cfg["drive_curve"].get(band), target_w)
+        """Interpolerat drive-värde för target_w ur kurvan för band + effektläge, eller None."""
+        if not self._pwr_mode:
+            return None
+        return curve_interpolate(cfg["drive_curve"].get(curve_key(band, self._pwr_mode)), target_w)
+
+    def _ff_drive(self, band, mode, target):
+        """Drive för TX-start: senast stabila för band+mode+effektläge och börvärde, annars kurvan.
+        Okänt effektläge ger None, så regleringen söker i stället för att gissa."""
+        if not self._pwr_mode:
+            return None
+        return choose_ff_drive(cfg.get("last_drive"),
+                               cfg["drive_curve"].get(curve_key(band, self._pwr_mode)),
+                               band, mode, target, self._pwr_mode)
+
+    def _remember_drive(self, band, mode, drive, target):
+        """Kom ihåg stabil drive för band+mode+effektläge (bara vanlig sändning, inte tune)."""
+        if not self._pwr_mode:
+            return
+        slot = cfg.setdefault("last_drive", {}).setdefault(
+            last_drive_key(band, mode, self._pwr_mode), {})
+        if slot.get(int(target)) != int(drive):
+            slot[int(target)] = int(drive)
+            save_config(cfg)
 
     def _curve_add_point(self, band, drive, power_w):
-        """Lägger till eller uppdaterar en kurv-punkt och sparar."""
-        curve_update(cfg["drive_curve"].setdefault(band, {}), drive, power_w)
+        """Lägger till eller uppdaterar en kurv-punkt (per effektläge) och sparar."""
+        if not self._pwr_mode:
+            return
+        curve_update(cfg["drive_curve"].setdefault(curve_key(band, self._pwr_mode), {}), drive, power_w)
         save_config(cfg)
 
     def _reg_mode(self):
@@ -1230,7 +1276,8 @@ class TunerGUI:
 
     def _reg_apply_ff(self):
         """Skicka FF-drive direkt via TCI om kurvan har ett lärt värde för nuvarande band/target."""
-        if not self._current_band:
+        band = self._tx_band()
+        if not band:
             return
         mode = self._reg_mode()
         if not mode:
@@ -1238,11 +1285,12 @@ class TunerGUI:
         target = cfg["target_power"].get(mode)
         if not target:
             return
-        ff_drive = self._curve_interpolate(self._current_band, target)
-        if ff_drive is None:
-            return
         trx = latest["tx_trx"]
         in_tune = latest["tune_active"].get(trx, False)
+        ff_drive = (self._curve_interpolate(band, target) if in_tune
+                    else self._ff_drive(band, mode, target))
+        if ff_drive is None:
+            return
         if in_tune:
             current = latest["tune_drive"].get(trx, 100)
             if ff_drive != current:
@@ -1303,11 +1351,11 @@ class TunerGUI:
             self._consec_transients = 0
             return
 
-        if self._current_band is None:
+        band = self._tx_band()
+        if band is None:
             return
 
         target = cfg["target_power"].get(mode, 300)
-        band   = self._current_band
         now    = time.monotonic()
         ts     = time.strftime("%H:%M:%S")
         rx_tag = f"RX{trx+1}"
@@ -1341,10 +1389,10 @@ class TunerGUI:
         # ── Feed-forward: hoppa till lärt drive-värde vid TX-start ──
         if not self._reg_ff_applied:
             self._reg_ff_applied = True
-            ff_drive = self._curve_interpolate(band, target)
+            ff_drive = self._ff_drive(band, mode, target) if not in_tune else self._curve_interpolate(band, target)
             if ff_drive is not None and ff_drive != current_drive:
                 set_drive(ff_drive)
-                _reg_logger.info(f"{ts},FF,{band},{mode},{target},{measured_w:.0f},,{current_drive},{ff_drive},feed-forward {rx_tag}")
+                _reg_logger.info(f"{ts},FF,{band},{mode},{target},{measured_w:.0f},,{current_drive},{ff_drive},feed-forward {rx_tag} band-{"TCI" if amp_band_from_freq(_active_tx_freq()) else "amp"}")
             self._reg_set_state("soker")
             return  # vänta en cykel på att drive ska sätta sig
 
@@ -1427,6 +1475,8 @@ class TunerGUI:
             if now - self._reg_stable_since >= 2.0:
                 # Stabil i 2s → spara kurv-punkt och gå till fas 2
                 self._curve_add_point(band, current_drive, avg)
+                if not in_tune:
+                    self._remember_drive(band, mode, current_drive, target)
                 self._reg_phase2       = True
                 self._reg_stable_since = None
                 self._power_history_slow.clear()
@@ -1627,6 +1677,34 @@ class TunerGUI:
         self._settings_dlg.show()
 
     def process_queue(self):
+        """Tömmer händelsekön. Ett fel i en händelse loggas till klient_fel.log och stoppar
+        aldrig loopen (annars fryser GUI:t med gamla värden)."""
+        try:
+            self._process_events()
+        except Exception:
+            self._log_exception()
+        finally:
+            try:
+                self.bridge.drain()
+            except Exception:
+                self._log_exception()
+            self.root.after(POLL_MS, self.process_queue)
+
+    def _log_exception(self):
+        """Skriv traceback till klient_fel.log (max 200 poster per körning)."""
+        import traceback
+        self._err_count = getattr(self, "_err_count", 0) + 1
+        if self._err_count > 200:
+            return
+        try:
+            with open(os.path.join(os.path.dirname(_cfg_path), "klient_fel.log"), "a",
+                      encoding="utf-8") as f:
+                f.write("--- %s ---\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                                traceback.format_exc()))
+        except OSError:
+            pass
+
+    def _process_events(self):
         try:
             while True:
                 event, data = self.queue.get_nowait()
@@ -1771,6 +1849,7 @@ class TunerGUI:
                         self._cfg_if(self.ant_btn, text=f"ANT: {data['ant']}")
 
                     if "power_mode" in data and data["power_mode"]:
+                        self._pwr_mode = data["power_mode"]
                         self._cfg_if(self.power_btn, text=f"Pwr: {data['power_mode']}")
 
                     if "input" in data:
@@ -1778,9 +1857,6 @@ class TunerGUI:
 
         except queue.Empty:
             pass
-
-        self.bridge.drain()
-        self.root.after(POLL_MS, self.process_queue)
 
     def _last_radio_name(self):
         radio = find_radio(self._last_input) if self._last_input else None
