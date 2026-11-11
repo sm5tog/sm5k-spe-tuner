@@ -285,9 +285,11 @@ oavsett band, antenn och driftsförhållanden. Aktiveras med REG-knappen.
 - Framtida: separata börvärden per band (HIGH/LOW-inställning på steget)
 
 ### Minne av senast stabila drive (från v1.2.2-arbetet, 2026-11-10)
-- `cfg["last_drive"]["{band}|{mode}|{HIGH/LOW}"] = {börvärde_W: drive}`, sparas i settings (överlever omstart). Ett värde per börvärde, så 300 W kan komma tillbaka efter ett byte till 200 W.
+- `cfg["last_drive"]["{band}|{mode}|{HIGH/LOW}|RX{1/2}"] = {börvärde_W: drive}`, sparas i settings (överlever omstart). Ett värde per börvärde, så 300 W kan komma tillbaka efter ett byte till 200 W.
 - Sparas när regleringen blir stabil (FAS1 → FAS2), bara vid vanlig sändning, inte `tune_drive`
-- Effektläget (HIGH/LOW, `power_mode` i telemetrin) ingår i nyckeln både för minnet och för drivkurvan (`"{band}|{HIGH/LOW}"`). Okänt läge ger inget minne och ingen kurva, regleringen söker då. Gamla nycklar utan läge migrerades till LOW (Jonny kört LOW hittills, 2026-11-10).
+- Effektläget (HIGH/LOW, `power_mode` i telemetrin) ingår i nyckeln både för minnet och för drivkurvan (`"{band}|{HIGH/LOW}|RX{1/2}"`). Okänt läge ger inget minne och ingen kurva, regleringen söker då. Gamla nycklar utan läge migrerades till LOW (Jonny kört LOW hittills, 2026-11-10).
+- Radiokanalen (RX1/RX2, `latest["tx_trx"]`) ingår i nyckeln: RX1 och RX2 har olika drive-till-effekt-samband. Gamla nycklar utan RX migrerades till RX2 (allt inlärt kom från RX2, 2026-11-11).
+- Diagnos: varje byte av `tx_trx` loggas i `reg_log_klient.csv` som `TXTRX` med källa (`trx`, `tx_sensors`, `tune`, `manuell`). Rad `VARNING ... stall RXn` betyder att mätt effekt ändrats mindre än 5 W över 6 drive-ändringar, alltså troligen fel radiokanal vald som aktiv.
 - Vid TX-start och vid börvärdesbyte med +/− används minnet för just det börvärdet först, annars kurvan (nedan).
 - Rörs inte av TX av, bara historiken nollställs. Funktion: `spe_logic.choose_ff_drive`.
 - Bandet för minne, FF och reglering kommer från radions TX-frekvens via TCI (`amp_band_from_freq`, BANDS utan l/h), reserv slutstegets rapporterade band. Slutstegets band släpar efter bandbyte (500 ms debounce + rapport först efter RF) och gav fel minne vid första TX efter bandbyte (loggen 2026-11-10). FF-raden i reglerloggen slutar på `band-TCI` eller `band-amp`.

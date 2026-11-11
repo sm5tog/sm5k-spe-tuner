@@ -55,20 +55,21 @@ def curve_update(curve, drive, power_w):
         curve[drive] = round(power_w, 1)
 
 
-def last_drive_key(band, mode, pmode):
-    """Nyckel för minnet: band, mode (CW/DIGU) och slutstegets effektläge (HIGH/LOW)."""
-    return f"{band}|{mode}|{pmode}"
+def last_drive_key(band, mode, pmode, trx):
+    """Nyckel för minnet: band, mode (CW/DIGU), slutstegets effektläge (HIGH/LOW) och radiokanal
+    (trx 0 = RX1, 1 = RX2)."""
+    return f"{band}|{mode}|{pmode}|RX{trx + 1}"
 
 
-def curve_key(band, pmode):
-    """Nyckel för drivkurvan: band och slutstegets effektläge (HIGH/LOW)."""
-    return f"{band}|{pmode}"
+def curve_key(band, pmode, trx):
+    """Nyckel för drivkurvan: band, effektläge och radiokanal."""
+    return f"{band}|{pmode}|RX{trx + 1}"
 
 
-def choose_ff_drive(last_drive, curve, band, mode, target_w, pmode):
-    """Drive att starta med: senast stabila drive för (band, mode, effektläge, börvärde),
-    annars interpolerat ur kurvan, annars None. last_drive: {"band|mode|pmode": {target: drive}}."""
-    mem = ((last_drive or {}).get(last_drive_key(band, mode, pmode)) or {}).get(int(target_w))
+def choose_ff_drive(last_drive, curve, band, mode, target_w, pmode, trx):
+    """Drive att starta med: senast stabila drive för (band, mode, effektläge, RX, börvärde),
+    annars interpolerat ur kurvan, annars None. last_drive: {"band|mode|pmode|RXn": {target: drive}}."""
+    mem = ((last_drive or {}).get(last_drive_key(band, mode, pmode, trx)) or {}).get(int(target_w))
     if mem is not None:
         return int(mem)
     return curve_interpolate(curve, target_w)

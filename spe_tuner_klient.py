@@ -35,8 +35,8 @@ DEFAULT_CONFIG = {
     "ampd_host": "192.168.68.107",
     "ampd_port": 5560,
     "target_power": {"CW": 300, "DIGU": 300},
-    "drive_curve":  {},   # {"band|HIGH/LOW": {drive: power}} — gemensam för alla modes
-    "last_drive":   {},   # {"band|mode|HIGH/LOW": {börvärde_W: drive}} — senast stabila drive
+    "drive_curve":  {},   # {"band|HIGH/LOW|RXn": {drive: power}} — gemensam för alla modes
+    "last_drive":   {},   # {"band|mode|HIGH/LOW|RXn": {börvärde_W: drive}} — senast stabila drive
     "radios": [
         {"name": "Radio 1", "input": 1, "tci_host": "127.0.0.1", "tci_port": 50001},
         {"name": "Radio 2", "input": 2, "tci_host": "127.0.0.1", "tci_port": 40001},
@@ -79,9 +79,13 @@ def load_config():
                     # Migrering från gammalt format (ett int-värde)
                     result["target_power"] = {"CW": int(tp), "DIGU": int(tp)}
             if "drive_curve" in saved:
-                # Gamla nycklar utan effektläge är inlärda i LOW (Jonny 2026-11-10)
+                # Gamla nycklar: utan effektläge = LOW, utan RX = RX2 (allt inlärt kom från RX2)
+                def _ck(k):
+                    if "|" not in k:
+                        k = f"{k}|LOW"
+                    return k if k.count("|") >= 2 else f"{k}|RX2"
                 result["drive_curve"] = {
-                    (band if "|" in band else f"{band}|LOW"):
+                    _ck(band):
                         {int(k): float(v) for k, v in pts.items()}
                     for band, pts in saved["drive_curve"].items()
                 }
@@ -93,6 +97,8 @@ def load_config():
                         continue
                     if k.count("|") == 1:          # gammal nyckel utan effektläge: inlärd i LOW
                         k = f"{k}|LOW"
+                    if k.count("|") == 2:          # gammal nyckel utan RX: inlärd på RX2
+                        k = f"{k}|RX2"
                     if "drive" in v and "target" in v:      # gammalt format: ett värde
                         out[k] = {int(v["target"]): int(v["drive"])}
                     else:
@@ -340,6 +346,13 @@ def _active_tx_freq():
         return latest["freq_rx1"] or latest["freq_rx0"]
     return latest["freq_rx0"] or latest["freq_rx1"]
 
+def _set_tx_trx(trx, source):
+    """Sätt aktiv TX-radiokanal och logga bytet med källa i reglerloggen (diagnos 2026-11-11)."""
+    if latest["tx_trx"] != trx:
+        _reg_logger.info(f"{time.strftime('%H:%M:%S')},TXTRX,,,,,,,,{source} RX{trx + 1}")
+    latest["tx_trx"] = trx
+
+
 def tci_listener_loop(callback, running):
     while running["run"]:
         url = _tci_url()
@@ -404,7 +417,7 @@ def tci_listener_loop(callback, running):
                         active = parts[1].strip().lower() == "true"
                         latest["trx_active"][trx] = active
                         if active:
-                            latest["tx_trx"] = trx
+                            _set_tx_trx(trx, "trx")
                             latest["freq"] = _active_tx_freq()
                             callback("radio_freq", latest["freq"])
                         callback("log", f"trx:{trx},{str(active).lower()} → TX RX{latest['tx_trx']+1}")
@@ -455,7 +468,7 @@ def tci_listener_loop(callback, running):
                         trx   = int(parts[0].split(":")[1])
                         power = float(parts[3])   # power_peak W
                         if power > 1.0 and trx != latest["tx_trx"]:
-                            latest["tx_trx"] = trx
+                            _set_tx_trx(trx, "tx_sensors")
                             latest["freq"] = _active_tx_freq()
                             callback("radio_freq", latest["freq"])
                             callback("log", f"tx_sensors:{trx} power={power:.0f}W → TX RX{trx+1}")
@@ -469,7 +482,7 @@ def tci_listener_loop(callback, running):
                         active = parts[1].strip().lower() == "true"
                         latest["tune_active"][trx] = active
                         if active and trx != latest["tx_trx"]:
-                            latest["tx_trx"] = trx
+                            _set_tx_trx(trx, "tune")
                             latest["freq"] = _active_tx_freq()
                             callback("radio_freq", latest["freq"])
                             callback("log", f"tune:{trx},true → TX RX{trx+1}")
@@ -949,6 +962,8 @@ class TunerGUI:
         self._band_pending         = None
         self._alarm_pending_since  = None
         self._current_band         = None
+        self._adj_meas             = deque(maxlen=6)   # mätt effekt vid de senaste drive-ändringarna
+        self._stall_warned         = False
         self._pwr_mode             = None   # slutstegets effektläge, HIGH/LOW (telemetri)
         self._reg_last_adjust      = 0.0
         self._reg_stable_since     = None
@@ -1175,7 +1190,7 @@ class TunerGUI:
             self._sweep_chk.config(text="Sweep OFF", fg=MUTED)
 
     def _toggle_rx(self):
-        latest["tx_trx"] = 1 - latest["tx_trx"]
+        _set_tx_trx(1 - latest["tx_trx"], "manuell")
         latest["freq"] = _active_tx_freq()
         self._log(f"TX RX manuellt → RX{latest['tx_trx']+1}")
         self.queue.put(("radio_freq", latest["freq"]))
@@ -1191,7 +1206,7 @@ class TunerGUI:
         """Interpolerat drive-värde för target_w ur kurvan för band + effektläge, eller None."""
         if not self._pwr_mode:
             return None
-        return curve_interpolate(cfg["drive_curve"].get(curve_key(band, self._pwr_mode)), target_w)
+        return curve_interpolate(cfg["drive_curve"].get(curve_key(band, self._pwr_mode, latest["tx_trx"])), target_w)
 
     def _ff_drive(self, band, mode, target):
         """Drive för TX-start: senast stabila för band+mode+effektläge och börvärde, annars kurvan.
@@ -1199,15 +1214,15 @@ class TunerGUI:
         if not self._pwr_mode:
             return None
         return choose_ff_drive(cfg.get("last_drive"),
-                               cfg["drive_curve"].get(curve_key(band, self._pwr_mode)),
-                               band, mode, target, self._pwr_mode)
+                               cfg["drive_curve"].get(curve_key(band, self._pwr_mode, latest["tx_trx"])),
+                               band, mode, target, self._pwr_mode, latest["tx_trx"])
 
     def _remember_drive(self, band, mode, drive, target):
         """Kom ihåg stabil drive för band+mode+effektläge (bara vanlig sändning, inte tune)."""
         if not self._pwr_mode:
             return
         slot = cfg.setdefault("last_drive", {}).setdefault(
-            last_drive_key(band, mode, self._pwr_mode), {})
+            last_drive_key(band, mode, self._pwr_mode, latest["tx_trx"]), {})
         if slot.get(int(target)) != int(drive):
             slot[int(target)] = int(drive)
             save_config(cfg)
@@ -1216,7 +1231,7 @@ class TunerGUI:
         """Lägger till eller uppdaterar en kurv-punkt (per effektläge) och sparar."""
         if not self._pwr_mode:
             return
-        curve_update(cfg["drive_curve"].setdefault(curve_key(band, self._pwr_mode), {}), drive, power_w)
+        curve_update(cfg["drive_curve"].setdefault(curve_key(band, self._pwr_mode, latest["tx_trx"]), {}), drive, power_w)
         save_config(cfg)
 
     def _reg_mode(self):
@@ -1349,6 +1364,8 @@ class TunerGUI:
             self._reg_stable_since  = None
             self._reg_phase2        = False
             self._consec_transients = 0
+            self._adj_meas.clear()
+            self._stall_warned      = False
             return
 
         band = self._tx_band()
@@ -1375,6 +1392,16 @@ class TunerGUI:
             self._reg_last_adjust = now
             self._power_history.clear()
             self._power_history_slow.clear()
+            # Varning om effekten inte rör sig alls trots många drive-ändringar (fel radiokanal?)
+            self._adj_meas.append(measured_w)
+            if (len(self._adj_meas) == self._adj_meas.maxlen and not self._stall_warned
+                    and max(self._adj_meas) - min(self._adj_meas) < 5.0):
+                self._stall_warned = True
+                msg = (f"VARNING: effekten ändras inte ({measured_w:.0f} W) trots {len(self._adj_meas)} "
+                       f"drive-ändringar på RX{trx+1}. Sänder en annan radiokanal?")
+                _reg_logger.info(f"{ts},VARNING,{band},{mode},{target},{measured_w:.0f},,{new_drive},,"
+                                 f"stall RX{trx+1}")
+                self._log(msg)
 
         # Nollställ om börvärdet ändrats under sändning
         if target != self._reg_last_target:

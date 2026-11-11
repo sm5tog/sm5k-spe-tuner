@@ -48,25 +48,25 @@ def test_curve_update_new_point_and_slow_merge():
 
 def test_ff_remembers_per_target():
     curve = {40: 100.0, 60: 300.0}
-    mem = {last_drive_key("40", "DIGU", "LOW"): {300: 55, 200: 32}}
-    assert choose_ff_drive(mem, curve, "40", "DIGU", 300, "LOW") == 55
-    assert choose_ff_drive(mem, curve, "40", "DIGU", 200, "LOW") == 32
-    assert choose_ff_drive(mem, curve, "40", "DIGU", 300, "LOW") == 55   # tillbaka till 300
+    mem = {last_drive_key("40", "DIGU", "LOW", 1): {300: 55, 200: 32}}
+    assert choose_ff_drive(mem, curve, "40", "DIGU", 300, "LOW", 1) == 55
+    assert choose_ff_drive(mem, curve, "40", "DIGU", 200, "LOW", 1) == 32
+    assert choose_ff_drive(mem, curve, "40", "DIGU", 300, "LOW", 1) == 55   # tillbaka till 300
 
 
 def test_ff_falls_back_to_curve():
     curve = {40: 100.0, 60: 300.0}
-    mem = {last_drive_key("20", "CW", "LOW"): {300: 55}}
-    assert choose_ff_drive(mem, curve, "20", "CW", 200, "LOW") == 50      # annat börvärde
-    assert choose_ff_drive(mem, curve, "20", "DIGU", 300, "LOW") == 60    # annat mode
-    assert choose_ff_drive({}, None, "20", "CW", 300, "LOW") is None
+    mem = {last_drive_key("20", "CW", "LOW", 1): {300: 55}}
+    assert choose_ff_drive(mem, curve, "20", "CW", 200, "LOW", 1) == 50      # annat börvärde
+    assert choose_ff_drive(mem, curve, "20", "DIGU", 300, "LOW", 1) == 60    # annat mode
+    assert choose_ff_drive({}, None, "20", "CW", 300, "LOW", 1) is None
 
 
 def test_high_and_low_do_not_mix():
-    mem = {last_drive_key("40", "CW", "LOW"): {300: 55}}
-    assert choose_ff_drive(mem, None, "40", "CW", 300, "LOW") == 55
-    assert choose_ff_drive(mem, None, "40", "CW", 300, "HIGH") is None
-    assert curve_key("40", "LOW") != curve_key("40", "HIGH")
+    mem = {last_drive_key("40", "CW", "LOW", 1): {300: 55}}
+    assert choose_ff_drive(mem, None, "40", "CW", 300, "LOW", 1) == 55
+    assert choose_ff_drive(mem, None, "40", "CW", 300, "HIGH", 1) is None
+    assert curve_key("40", "LOW", 1) != curve_key("40", "HIGH", 1)
 
 
 def test_amp_band_from_freq_matches_curve_keys():
@@ -80,3 +80,11 @@ def test_amp_band_from_freq_matches_curve_keys():
     got = {amp_band_from_freq(f) for f in (28_300_000, 24_930_000, 21_074_000, 18_100_000,
            14_074_000, 10_136_000, 7_074_000, 50_313_000, 3_573_000)}
     assert got == {"10", "12", "15", "17", "20", "30", "40", "6", "80"}
+
+
+def test_rx1_and_rx2_do_not_mix():
+    mem = {last_drive_key("40", "DIGU", "LOW", 1): {300: 55}}      # RX2 (trx 1)
+    assert choose_ff_drive(mem, None, "40", "DIGU", 300, "LOW", 1) == 55
+    assert choose_ff_drive(mem, None, "40", "DIGU", 300, "LOW", 0) is None   # RX1 har inget minne
+    assert curve_key("40", "LOW", 0) != curve_key("40", "LOW", 1)
+    assert last_drive_key("40", "DIGU", "LOW", 0).endswith("|RX1")
